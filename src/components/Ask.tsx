@@ -1,8 +1,9 @@
 'use client';
 
-import React, {useState, useRef, useEffect} from 'react';
+import React, {useState, useRef, useEffect, useCallback} from 'react';
 import {FaChevronLeft, FaChevronRight } from 'react-icons/fa';
 import Markdown from './Markdown';
+import CodeMapView from './CodeMapView';
 import { useLanguage } from '@/contexts/LanguageContext';
 import RepoInfo from '@/types/repoinfo';
 import getRepoUrl from '@/utils/getRepoUrl';
@@ -33,6 +34,17 @@ interface ResearchStage {
   type: 'plan' | 'update' | 'conclusion';
 }
 
+interface SavedConversation {
+  id: string;
+  title: string;
+  timestamp: number;
+  question: string;
+  response: string;
+  conversationHistory: Message[];
+  repoUrl: string;
+  codeMapContent?: string;
+}
+
 interface AskProps {
   repoInfo: RepoInfo;
   provider?: string;
@@ -40,7 +52,39 @@ interface AskProps {
   isCustomModel?: boolean;
   customModel?: string;
   language?: string;
+  branch?: string;
   onRef?: (ref: { clearConversation: () => void }) => void;
+}
+
+const HISTORY_KEY = 'deepwiki_conversation_history';
+const MAX_HISTORY = 50;
+
+function loadHistory(): SavedConversation[] {
+  try {
+    const raw = localStorage.getItem(HISTORY_KEY);
+    return raw ? JSON.parse(raw) : [];
+  } catch {
+    return [];
+  }
+}
+
+function saveToHistory(conv: SavedConversation) {
+  try {
+    const history = loadHistory();
+    const updated = [conv, ...history.filter(c => c.id !== conv.id)].slice(0, MAX_HISTORY);
+    localStorage.setItem(HISTORY_KEY, JSON.stringify(updated));
+  } catch {
+    // ignore storage errors
+  }
+}
+
+function deleteFromHistory(id: string) {
+  try {
+    const history = loadHistory().filter(c => c.id !== id);
+    localStorage.setItem(HISTORY_KEY, JSON.stringify(history));
+  } catch {
+    // ignore
+  }
 }
 
 const Ask: React.FC<AskProps> = ({
@@ -50,12 +94,25 @@ const Ask: React.FC<AskProps> = ({
   isCustomModel = false,
   customModel = '',
   language = 'en',
+  branch,
   onRef
 }) => {
   const [question, setQuestion] = useState('');
   const [response, setResponse] = useState('');
   const [isLoading, setIsLoading] = useState(false);
   const [deepResearch, setDeepResearch] = useState(false);
+
+  // Codemap state
+  const [codeMap, setCodeMap] = useState(false);
+  const [codeMapContent, setCodeMapContent] = useState('');
+  const [codeMapLoading, setCodeMapLoading] = useState(false);
+  const [codeMapExpanded, setCodeMapExpanded] = useState(true);
+  const [codeMapFullscreen, setCodeMapFullscreen] = useState(false);
+  const currentConvIdRef = useRef<string>('');
+
+  // History panel state
+  const [historyOpen, setHistoryOpen] = useState(false);
+  const [savedHistory, setSavedHistory] = useState<SavedConversation[]>([]);
 
   // Model selection state
   const [selectedProvider, setSelectedProvider] = useState(provider);
@@ -65,7 +122,6 @@ const Ask: React.FC<AskProps> = ({
   const [isModelSelectionModalOpen, setIsModelSelectionModalOpen] = useState(false);
   const [isComprehensiveView, setIsComprehensiveView] = useState(true);
 
-  // Get language context for translations
   const { messages } = useLanguage();
 
   // Research navigation state
@@ -79,32 +135,22 @@ const Ask: React.FC<AskProps> = ({
   const providerRef = useRef(provider);
   const modelRef = useRef(model);
 
-  // Focus input on component mount
   useEffect(() => {
-    if (inputRef.current) {
-      inputRef.current.focus();
-    }
+    if (inputRef.current) inputRef.current.focus();
   }, []);
 
-  // Expose clearConversation method to parent component
   useEffect(() => {
-    if (onRef) {
-      onRef({ clearConversation });
-    }
+    if (onRef) onRef({ clearConversation });
   }, [onRef]);
 
-  // Scroll to bottom of response when it changes
   useEffect(() => {
     if (responseRef.current) {
       responseRef.current.scrollTop = responseRef.current.scrollHeight;
     }
   }, [response]);
 
-  // Close WebSocket when component unmounts
   useEffect(() => {
-    return () => {
-      closeWebSocket(webSocketRef.current);
-    };
+    return () => { closeWebSocket(webSocketRef.current); };
   }, []);
 
   useEffect(() => {
@@ -116,23 +162,13 @@ const Ask: React.FC<AskProps> = ({
     const fetchModel = async () => {
       try {
         setIsLoading(true);
-
-        const response = await fetch('/api/models/config');
-        if (!response.ok) {
-          throw new Error(`Error fetching model configurations: ${response.status}`);
-        }
-
-        const data = await response.json();
-
-        // use latest provider/model ref to check
-        if(providerRef.current == '' || modelRef.current== '') {
+        const res = await fetch('/api/models/config');
+        if (!res.ok) throw new Error(`Error fetching model configurations: ${res.status}`);
+        const data = await res.json();
+        if (providerRef.current === '' || modelRef.current === '') {
           setSelectedProvider(data.defaultProvider);
-
-          // Find the default provider and set its default model
-          const selectedProvider = data.providers.find((p:Provider) => p.id === data.defaultProvider);
-          if (selectedProvider && selectedProvider.models.length > 0) {
-            setSelectedModel(selectedProvider.models[0].id);
-          }
+          const sp = data.providers.find((p: Provider) => p.id === data.defaultProvider);
+          if (sp && sp.models.length > 0) setSelectedModel(sp.models[0].id);
         } else {
           setSelectedProvider(providerRef.current);
           setSelectedModel(modelRef.current);
@@ -143,10 +179,73 @@ const Ask: React.FC<AskProps> = ({
         setIsLoading(false);
       }
     };
-    if(provider == '' || model == '') {
-      fetchModel()
-    }
+    if (provider === '' || model === '') fetchModel();
   }, [provider, model]);
+
+  // ── Codemap helper ────────────────────────────────────────────────────────
+  const fetchCodeMap = useCallback(async (
+    question: string,
+    history: Message[],
+    prov: string,
+    mdl: string
+  ) => {
+    setCodeMapContent('');
+    setCodeMapLoading(true);
+    setCodeMapExpanded(true);
+    try {
+      const requestBody = {
+        repo_url: getRepoUrl(repoInfo),
+        type: repoInfo.type,
+        messages: [...history, { role: 'user', content: question }],
+        provider: prov,
+        model: isCustomSelectedModel ? customSelectedModel : mdl,
+        language,
+        ...(repoInfo?.token ? { token: repoInfo.token } : {}),
+        ...(branch ? { branch } : {}),
+      };
+      const res = await fetch('/api/codemap', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(requestBody),
+      });
+      if (!res.ok || !res.body) {
+        setCodeMapContent('> Failed to generate codemap.');
+        return;
+      }
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let full = '';
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        full += decoder.decode(value, { stream: true });
+        setCodeMapContent(full);
+      }
+    } catch (e) {
+      setCodeMapContent(`> Error: ${e}`);
+    } finally {
+      setCodeMapLoading(false);
+    }
+  }, [repoInfo, isCustomSelectedModel, customSelectedModel, language]);
+
+  // ── History helpers ───────────────────────────────────────────────────────
+  const openHistory = () => {
+    setSavedHistory(loadHistory());
+    setHistoryOpen(true);
+  };
+
+  const restoreConversation = (conv: SavedConversation) => {
+    setQuestion(conv.question);
+    setResponse(conv.response);
+    setConversationHistory(conv.conversationHistory);
+    setResearchIteration(0);
+    setResearchComplete(true);
+    setResearchStages([]);
+    setCurrentStageIndex(0);
+    setCodeMapContent(conv.codeMapContent || '');
+    setCodeMapExpanded(true);
+    setHistoryOpen(false);
+  };
 
   const clearConversation = () => {
     setQuestion('');
@@ -156,241 +255,133 @@ const Ask: React.FC<AskProps> = ({
     setResearchComplete(false);
     setResearchStages([]);
     setCurrentStageIndex(0);
-    if (inputRef.current) {
-      inputRef.current.focus();
-    }
+    setCodeMapContent('');
+    setCodeMapFullscreen(false);
+    if (inputRef.current) inputRef.current.focus();
   };
-  const downloadresponse = () =>{
-  const blob = new Blob([response], { type: 'text/markdown' });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = `response-${new Date().toISOString().slice(0, 19).replace(/:/g, '-')}.md`;
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
-  URL.revokeObjectURL(url);
-}
 
-  // Function to check if research is complete based on response content
+  const downloadresponse = () => {
+    const blob = new Blob([response], { type: 'text/markdown' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `response-${new Date().toISOString().slice(0, 19).replace(/:/g, '-')}.md`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  };
+
+  // ── Research helpers ──────────────────────────────────────────────────────
   const checkIfResearchComplete = (content: string): boolean => {
-    // Check for explicit final conclusion markers
-    if (content.includes('## Final Conclusion')) {
-      return true;
-    }
-
-    // Check for conclusion sections that don't indicate further research
+    if (content.includes('## Final Conclusion')) return true;
     if ((content.includes('## Conclusion') || content.includes('## Summary')) &&
       !content.includes('I will now proceed to') &&
       !content.includes('Next Steps') &&
-      !content.includes('next iteration')) {
-      return true;
-    }
-
-    // Check for phrases that explicitly indicate completion
+      !content.includes('next iteration')) return true;
     if (content.includes('This concludes our research') ||
       content.includes('This completes our investigation') ||
       content.includes('This concludes the deep research process') ||
       content.includes('Key Findings and Implementation Details') ||
       content.includes('In conclusion,') ||
-      (content.includes('Final') && content.includes('Conclusion'))) {
-      return true;
-    }
-
-    // Check for topic-specific completion indicators
+      (content.includes('Final') && content.includes('Conclusion'))) return true;
     if (content.includes('Dockerfile') &&
       (content.includes('This Dockerfile') || content.includes('The Dockerfile')) &&
       !content.includes('Next Steps') &&
-      !content.includes('In the next iteration')) {
-      return true;
-    }
-
+      !content.includes('In the next iteration')) return true;
     return false;
   };
 
-  // Function to extract research stages from the response
   const extractResearchStage = (content: string, iteration: number): ResearchStage | null => {
-    // Check for research plan (first iteration)
     if (iteration === 1 && content.includes('## Research Plan')) {
       const planMatch = content.match(/## Research Plan([\s\S]*?)(?:## Next Steps|$)/);
-      if (planMatch) {
-        return {
-          title: 'Research Plan',
-          content: content,
-          iteration: 1,
-          type: 'plan'
-        };
-      }
+      if (planMatch) return { title: 'Research Plan', content, iteration: 1, type: 'plan' };
     }
-
-    // Check for research updates (iterations 1-4)
     if (iteration >= 1 && iteration <= 4) {
       const updateMatch = content.match(new RegExp(`## Research Update ${iteration}([\\s\\S]*?)(?:## Next Steps|$)`));
-      if (updateMatch) {
-        return {
-          title: `Research Update ${iteration}`,
-          content: content,
-          iteration: iteration,
-          type: 'update'
-        };
-      }
+      if (updateMatch) return { title: `Research Update ${iteration}`, content, iteration, type: 'update' };
     }
-
-    // Check for final conclusion
     if (content.includes('## Final Conclusion')) {
       const conclusionMatch = content.match(/## Final Conclusion([\s\S]*?)$/);
-      if (conclusionMatch) {
-        return {
-          title: 'Final Conclusion',
-          content: content,
-          iteration: iteration,
-          type: 'conclusion'
-        };
-      }
+      if (conclusionMatch) return { title: 'Final Conclusion', content, iteration, type: 'conclusion' };
     }
-
     return null;
   };
 
-  // Function to navigate to a specific research stage
   const navigateToStage = (index: number) => {
     if (index >= 0 && index < researchStages.length) {
       setCurrentStageIndex(index);
       setResponse(researchStages[index].content);
     }
   };
+  const navigateToNextStage = () => { if (currentStageIndex < researchStages.length - 1) navigateToStage(currentStageIndex + 1); };
+  const navigateToPreviousStage = () => { if (currentStageIndex > 0) navigateToStage(currentStageIndex - 1); };
 
-  // Function to navigate to the next research stage
-  const navigateToNextStage = () => {
-    if (currentStageIndex < researchStages.length - 1) {
-      navigateToStage(currentStageIndex + 1);
-    }
-  };
-
-  // Function to navigate to the previous research stage
-  const navigateToPreviousStage = () => {
-    if (currentStageIndex > 0) {
-      navigateToStage(currentStageIndex - 1);
-    }
-  };
-
-  // WebSocket reference
   const webSocketRef = useRef<WebSocket | null>(null);
 
-  // Function to continue research automatically
   const continueResearch = async () => {
     if (!deepResearch || researchComplete || !response || isLoading) return;
-
-    // Add a small delay to allow the user to read the current response
     await new Promise(resolve => setTimeout(resolve, 2000));
-
     setIsLoading(true);
-
     try {
-      // Store the current response for use in the history
       const currentResponse = response;
-
-      // Create a new message from the AI's previous response
       const newHistory: Message[] = [
         ...conversationHistory,
-        {
-          role: 'assistant',
-          content: currentResponse
-        },
-        {
-          role: 'user',
-          content: '[DEEP RESEARCH] Continue the research'
-        }
+        { role: 'assistant', content: currentResponse },
+        { role: 'user', content: '[DEEP RESEARCH] Continue the research' }
       ];
-
-      // Update conversation history
       setConversationHistory(newHistory);
-
-      // Increment research iteration
       const newIteration = researchIteration + 1;
       setResearchIteration(newIteration);
-
-      // Clear previous response
       setResponse('');
 
-      // Prepare the request body
       const requestBody: ChatCompletionRequest = {
         repo_url: getRepoUrl(repoInfo),
         type: repoInfo.type,
         messages: newHistory.map(msg => ({ role: msg.role as 'user' | 'assistant', content: msg.content })),
         provider: selectedProvider,
         model: isCustomSelectedModel ? customSelectedModel : selectedModel,
-        language: language
+        language,
+        ...(repoInfo?.token ? { token: repoInfo.token } : {}),
+        ...(branch ? { branch } : {}),
       };
 
-      // Add tokens if available
-      if (repoInfo?.token) {
-        requestBody.token = repoInfo.token;
-      }
-
-      // Close any existing WebSocket connection
       closeWebSocket(webSocketRef.current);
-
       let fullResponse = '';
 
-      // Create a new WebSocket connection
       webSocketRef.current = createChatWebSocket(
         requestBody,
-        // Message handler
         (message: string) => {
           fullResponse += message;
           setResponse(fullResponse);
-
-          // Extract research stage if this is a deep research response
           if (deepResearch) {
             const stage = extractResearchStage(fullResponse, newIteration);
             if (stage) {
-              // Add the stage to the research stages if it's not already there
               setResearchStages(prev => {
-                // Check if we already have this stage
-                const existingStageIndex = prev.findIndex(s => s.iteration === stage.iteration && s.type === stage.type);
-                if (existingStageIndex >= 0) {
-                  // Update existing stage
-                  const newStages = [...prev];
-                  newStages[existingStageIndex] = stage;
-                  return newStages;
-                } else {
-                  // Add new stage
-                  return [...prev, stage];
-                }
+                const idx = prev.findIndex(s => s.iteration === stage.iteration && s.type === stage.type);
+                if (idx >= 0) { const n = [...prev]; n[idx] = stage; return n; }
+                return [...prev, stage];
               });
-
-              // Update current stage index to the latest stage
               setCurrentStageIndex(researchStages.length);
             }
           }
         },
-        // Error handler
         (error: Event) => {
           console.error('WebSocket error:', error);
           setResponse(prev => prev + '\n\nError: WebSocket connection failed. Falling back to HTTP...');
-
-          // Fallback to HTTP if WebSocket fails
           fallbackToHttp(requestBody);
         },
-        // Close handler
         () => {
-          // Check if research is complete when the WebSocket closes
           const isComplete = checkIfResearchComplete(fullResponse);
-
-          // Force completion after a maximum number of iterations (5)
           const forceComplete = newIteration >= 5;
-
           if (forceComplete && !isComplete) {
-            // If we're forcing completion, append a comprehensive conclusion to the response
-            const completionNote = "\n\n## Final Conclusion\nAfter multiple iterations of deep research, we've gathered significant insights about this topic. This concludes our investigation process, having reached the maximum number of research iterations. The findings presented across all iterations collectively form our comprehensive answer to the original question.";
-            fullResponse += completionNote;
+            const note = "\n\n## Final Conclusion\nAfter multiple iterations of deep research, we've gathered significant insights about this topic. This concludes our investigation process, having reached the maximum number of research iterations. The findings presented across all iterations collectively form our comprehensive answer to the original question.";
+            fullResponse += note;
             setResponse(fullResponse);
             setResearchComplete(true);
           } else {
             setResearchComplete(isComplete);
           }
-
           setIsLoading(false);
         }
       );
@@ -402,69 +393,39 @@ const Ask: React.FC<AskProps> = ({
     }
   };
 
-  // Fallback to HTTP if WebSocket fails
   const fallbackToHttp = async (requestBody: ChatCompletionRequest) => {
     try {
-      // Make the API call using HTTP
-      const apiResponse = await fetch(`/api/chat/stream`, {
+      const apiResponse = await fetch('/api/chat/stream', {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify(requestBody)
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(requestBody),
       });
-
-      if (!apiResponse.ok) {
-        throw new Error(`API error: ${apiResponse.status}`);
-      }
-
-      // Process the streaming response
+      if (!apiResponse.ok) throw new Error(`API error: ${apiResponse.status}`);
       const reader = apiResponse.body?.getReader();
       const decoder = new TextDecoder();
-
-      if (!reader) {
-        throw new Error('Failed to get response reader');
-      }
-
-      // Read the stream
+      if (!reader) throw new Error('Failed to get response reader');
       let fullResponse = '';
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
-
-        const chunk = decoder.decode(value, { stream: true });
-        fullResponse += chunk;
+        fullResponse += decoder.decode(value, { stream: true });
         setResponse(fullResponse);
-
-        // Extract research stage if this is a deep research response
         if (deepResearch) {
           const stage = extractResearchStage(fullResponse, researchIteration);
           if (stage) {
-            // Add the stage to the research stages
             setResearchStages(prev => {
-              const existingStageIndex = prev.findIndex(s => s.iteration === stage.iteration && s.type === stage.type);
-              if (existingStageIndex >= 0) {
-                const newStages = [...prev];
-                newStages[existingStageIndex] = stage;
-                return newStages;
-              } else {
-                return [...prev, stage];
-              }
+              const idx = prev.findIndex(s => s.iteration === stage.iteration && s.type === stage.type);
+              if (idx >= 0) { const n = [...prev]; n[idx] = stage; return n; }
+              return [...prev, stage];
             });
           }
         }
       }
-
-      // Check if research is complete
       const isComplete = checkIfResearchComplete(fullResponse);
-
-      // Force completion after a maximum number of iterations (5)
       const forceComplete = researchIteration >= 5;
-
       if (forceComplete && !isComplete) {
-        // If we're forcing completion, append a comprehensive conclusion to the response
-        const completionNote = "\n\n## Final Conclusion\nAfter multiple iterations of deep research, we've gathered significant insights about this topic. This concludes our investigation process, having reached the maximum number of research iterations. The findings presented across all iterations collectively form our comprehensive answer to the original question.";
-        fullResponse += completionNote;
+        const note = "\n\n## Final Conclusion\nAfter multiple iterations of deep research, we've gathered significant insights about this topic. This concludes our investigation process, having reached the maximum number of research iterations. The findings presented across all iterations collectively form our comprehensive answer to the original question.";
+        fullResponse += note;
         setResponse(fullResponse);
         setResearchComplete(true);
       } else {
@@ -479,143 +440,130 @@ const Ask: React.FC<AskProps> = ({
     }
   };
 
-  // Effect to continue research when response is updated
   useEffect(() => {
     if (deepResearch && response && !isLoading && !researchComplete) {
       const isComplete = checkIfResearchComplete(response);
       if (isComplete) {
         setResearchComplete(true);
       } else if (researchIteration > 0 && researchIteration < 5) {
-        // Only auto-continue if we're already in a research process and haven't reached max iterations
-        // Use setTimeout to avoid potential infinite loops
-        const timer = setTimeout(() => {
-          continueResearch();
-        }, 1000);
+        const timer = setTimeout(() => { continueResearch(); }, 1000);
         return () => clearTimeout(timer);
       }
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [response, isLoading, deepResearch, researchComplete, researchIteration]);
 
-  // Effect to update research stages when the response changes
   useEffect(() => {
     if (deepResearch && response && !isLoading) {
-      // Try to extract a research stage from the response
       const stage = extractResearchStage(response, researchIteration);
       if (stage) {
-        // Add or update the stage in the research stages
         setResearchStages(prev => {
-          // Check if we already have this stage
-          const existingStageIndex = prev.findIndex(s => s.iteration === stage.iteration && s.type === stage.type);
-          if (existingStageIndex >= 0) {
-            // Update existing stage
-            const newStages = [...prev];
-            newStages[existingStageIndex] = stage;
-            return newStages;
-          } else {
-            // Add new stage
-            return [...prev, stage];
-          }
+          const idx = prev.findIndex(s => s.iteration === stage.iteration && s.type === stage.type);
+          if (idx >= 0) { const n = [...prev]; n[idx] = stage; return n; }
+          return [...prev, stage];
         });
-
-        // Update current stage index to point to this stage
         setCurrentStageIndex(prev => {
           const newIndex = researchStages.findIndex(s => s.iteration === stage.iteration && s.type === stage.type);
           return newIndex >= 0 ? newIndex : prev;
         });
       }
     }
-
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [response, isLoading, deepResearch, researchIteration]);
 
+  // Save conversation to history when response completes
+  useEffect(() => {
+    if (response && !isLoading && question) {
+      const id = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      currentConvIdRef.current = id;
+      const conv: SavedConversation = {
+        id,
+        title: question.slice(0, 60) + (question.length > 60 ? '…' : ''),
+        timestamp: Date.now(),
+        question,
+        response,
+        conversationHistory,
+        repoUrl: getRepoUrl(repoInfo),
+        codeMapContent: codeMapContent || undefined,
+      };
+      saveToHistory(conv);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isLoading]);
+
+  // Update history entry with codemap content once codemap finishes loading
+  useEffect(() => {
+    if (!codeMapLoading && codeMapContent && currentConvIdRef.current) {
+      const history = loadHistory();
+      const existing = history.find(c => c.id === currentConvIdRef.current);
+      if (existing) {
+        saveToHistory({ ...existing, codeMapContent });
+      }
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [codeMapLoading]);
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-
     if (!question.trim() || isLoading) return;
-
     handleConfirmAsk();
   };
 
-  // Handle confirm and send request
   const handleConfirmAsk = async () => {
     setIsLoading(true);
     setResponse('');
+    setCodeMapContent('');
     setResearchIteration(0);
     setResearchComplete(false);
 
     try {
-      // Create initial message
       const initialMessage: Message = {
         role: 'user',
-        content: deepResearch ? `[DEEP RESEARCH] ${question}` : question
+        content: deepResearch ? `[DEEP RESEARCH] ${question}` : question,
       };
-
-      // Set initial conversation history
       const newHistory: Message[] = [initialMessage];
       setConversationHistory(newHistory);
 
-      // Prepare request body
       const requestBody: ChatCompletionRequest = {
         repo_url: getRepoUrl(repoInfo),
         type: repoInfo.type,
         messages: newHistory.map(msg => ({ role: msg.role as 'user' | 'assistant', content: msg.content })),
         provider: selectedProvider,
         model: isCustomSelectedModel ? customSelectedModel : selectedModel,
-        language: language
+        language,
+        ...(repoInfo?.token ? { token: repoInfo.token } : {}),
+        ...(branch ? { branch } : {}),
       };
 
-      // Add tokens if available
-      if (repoInfo?.token) {
-        requestBody.token = repoInfo.token;
-      }
-
-      // Close any existing WebSocket connection
       closeWebSocket(webSocketRef.current);
-
       let fullResponse = '';
 
-      // Create a new WebSocket connection
       webSocketRef.current = createChatWebSocket(
         requestBody,
-        // Message handler
         (message: string) => {
           fullResponse += message;
           setResponse(fullResponse);
-
-          // Extract research stage if this is a deep research response
           if (deepResearch) {
-            const stage = extractResearchStage(fullResponse, 1); // First iteration
-            if (stage) {
-              // Add the stage to the research stages
-              setResearchStages([stage]);
-              setCurrentStageIndex(0);
-            }
+            const stage = extractResearchStage(fullResponse, 1);
+            if (stage) { setResearchStages([stage]); setCurrentStageIndex(0); }
           }
         },
-        // Error handler
         (error: Event) => {
           console.error('WebSocket error:', error);
           setResponse(prev => prev + '\n\nError: WebSocket connection failed. Falling back to HTTP...');
-
-          // Fallback to HTTP if WebSocket fails
           fallbackToHttp(requestBody);
         },
-        // Close handler
         () => {
-          // If deep research is enabled, check if we should continue
           if (deepResearch) {
             const isComplete = checkIfResearchComplete(fullResponse);
             setResearchComplete(isComplete);
-
-            // If not complete, start the research process
-            if (!isComplete) {
-              setResearchIteration(1);
-              // The continueResearch function will be triggered by the useEffect
-            }
+            if (!isComplete) setResearchIteration(1);
           }
-
           setIsLoading(false);
+          // Trigger codemap after response completes
+          if (codeMap) {
+            fetchCodeMap(question, [], selectedProvider, isCustomSelectedModel ? customSelectedModel : selectedModel);
+          }
         }
       );
     } catch (error) {
@@ -629,18 +577,28 @@ const Ask: React.FC<AskProps> = ({
   const [buttonWidth, setButtonWidth] = useState(0);
   const buttonRef = useRef<HTMLButtonElement>(null);
 
-  // Measure button width and update state
   useEffect(() => {
-    if (buttonRef.current) {
-      const width = buttonRef.current.offsetWidth;
-      setButtonWidth(width);
-    }
+    if (buttonRef.current) setButtonWidth(buttonRef.current.offsetWidth);
   }, [messages.ask?.askButton, isLoading]);
 
   return (
     <div>
       <div className="p-4">
-        <div className="flex items-center justify-end mb-4">
+        {/* Top toolbar */}
+        <div className="flex items-center justify-between mb-4">
+          {/* History button */}
+          <button
+            type="button"
+            onClick={openHistory}
+            className="text-xs px-2.5 py-1 rounded border border-[var(--border-color)]/40 bg-[var(--background)]/10 text-[var(--foreground)]/80 hover:bg-[var(--background)]/30 hover:text-[var(--foreground)] transition-colors flex items-center gap-1.5"
+            title="历史对话"
+          >
+            <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
+            </svg>
+            <span>历史</span>
+          </button>
+
           {/* Model selection button */}
           <button
             type="button"
@@ -690,18 +648,14 @@ const Ask: React.FC<AskProps> = ({
             </button>
           </div>
 
-          {/* Deep Research toggle */}
-          <div className="flex items-center mt-2 justify-between">
+          {/* Toggles row */}
+          <div className="flex items-center mt-2 gap-4 flex-wrap">
+            {/* Deep Research toggle */}
             <div className="group relative">
               <label className="flex items-center cursor-pointer">
                 <span className="text-xs text-gray-600 dark:text-gray-400 mr-2">Deep Research</span>
                 <div className="relative">
-                  <input
-                    type="checkbox"
-                    checked={deepResearch}
-                    onChange={() => setDeepResearch(!deepResearch)}
-                    className="sr-only"
-                  />
+                  <input type="checkbox" checked={deepResearch} onChange={() => setDeepResearch(!deepResearch)} className="sr-only" />
                   <div className={`w-10 h-5 rounded-full transition-colors ${deepResearch ? 'bg-purple-600' : 'bg-gray-300 dark:bg-gray-600'}`}></div>
                   <div className={`absolute left-0.5 top-0.5 w-4 h-4 rounded-full bg-white transition-transform transform ${deepResearch ? 'translate-x-5' : ''}`}></div>
                 </div>
@@ -709,95 +663,157 @@ const Ask: React.FC<AskProps> = ({
               <div className="absolute bottom-full left-0 mb-2 hidden group-hover:block bg-gray-800 text-white text-xs rounded p-2 w-72 z-10">
                 <div className="relative">
                   <div className="absolute -bottom-2 left-4 w-0 h-0 border-l-4 border-r-4 border-t-4 border-transparent border-t-gray-800"></div>
-                  <p className="mb-1">Deep Research conducts a multi-turn investigation process:</p>
-                  <ul className="list-disc pl-4 text-xs">
-                    <li><strong>Initial Research:</strong> Creates a research plan and initial findings</li>
-                    <li><strong>Iteration 1:</strong> Explores specific aspects in depth</li>
-                    <li><strong>Iteration 2:</strong> Investigates remaining questions</li>
-                    <li><strong>Iterations 3-4:</strong> Dives deeper into complex areas</li>
-                    <li><strong>Final Conclusion:</strong> Comprehensive answer based on all iterations</li>
-                  </ul>
-                  <p className="mt-1 text-xs italic">The AI automatically continues research until complete (up to 5 iterations)</p>
+                  <p className="mb-1">Deep Research conducts a multi-turn investigation process.</p>
                 </div>
               </div>
             </div>
-            {deepResearch && (
-              <div className="text-xs text-purple-600 dark:text-purple-400">
-                Multi-turn research process enabled
-                {researchIteration > 0 && !researchComplete && ` (iteration ${researchIteration})`}
-                {researchComplete && ` (complete)`}
+
+            {/* Codemap toggle */}
+            <div className="group relative">
+              <label className="flex items-center cursor-pointer">
+                <span className="text-xs text-gray-600 dark:text-gray-400 mr-2">代码调用链</span>
+                <div className="relative">
+                  <input type="checkbox" checked={codeMap} onChange={() => setCodeMap(!codeMap)} className="sr-only" />
+                  <div className={`w-10 h-5 rounded-full transition-colors ${codeMap ? 'bg-teal-600' : 'bg-gray-300 dark:bg-gray-600'}`}></div>
+                  <div className={`absolute left-0.5 top-0.5 w-4 h-4 rounded-full bg-white transition-transform transform ${codeMap ? 'translate-x-5' : ''}`}></div>
+                </div>
+              </label>
+              <div className="absolute bottom-full left-0 mb-2 hidden group-hover:block bg-gray-800 text-white text-xs rounded p-2 w-64 z-10">
+                <div className="relative">
+                  <div className="absolute -bottom-2 left-4 w-0 h-0 border-l-4 border-r-4 border-t-4 border-transparent border-t-gray-800"></div>
+                  <p>开启后，在 AI 回答的同时生成代码调用链路 Mermaid 图，直观展示函数/模块间的依赖关系。</p>
+                </div>
               </div>
-            )}
+            </div>
+
+            {/* Status labels */}
+            <div className="ml-auto flex items-center gap-2">
+              {deepResearch && (
+                <span className="text-xs text-purple-600 dark:text-purple-400">
+                  Multi-turn research
+                  {researchIteration > 0 && !researchComplete && ` (iter ${researchIteration})`}
+                  {researchComplete && ` (complete)`}
+                </span>
+              )}
+              {codeMap && (
+                <span className="text-xs text-teal-600 dark:text-teal-400 flex items-center gap-1">
+                  <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 20l-5.447-2.724A1 1 0 013 16.382V5.618a1 1 0 011.447-.894L9 7m0 13l6-3m-6 3V7m6 10l4.553 2.276A1 1 0 0021 18.382V7.618a1 1 0 00-.553-.894L15 4m0 13V4m0 0L9 7" />
+                  </svg>
+                  Codemap ON
+                </span>
+              )}
+            </div>
           </div>
         </form>
 
         {/* Response area */}
         {response && (
           <div className="border-t border-gray-200 dark:border-gray-700 mt-4">
-            <div
-              ref={responseRef}
-              className="p-4 max-h-[500px] overflow-y-auto"
-            >
+            <div ref={responseRef} className="p-4 max-h-[500px] overflow-y-auto">
               <Markdown content={response} />
             </div>
 
-            {/* Research navigation and clear button */}
+            {/* Bottom toolbar */}
             <div className="p-2 flex justify-between items-center border-t border-gray-200 dark:border-gray-700">
               {/* Research navigation */}
               {deepResearch && researchStages.length > 1 && (
                 <div className="flex items-center space-x-2">
-                  <button
-                    onClick={() => navigateToPreviousStage()}
-                    disabled={currentStageIndex === 0}
-                    className={`p-1 rounded-md ${currentStageIndex === 0 ? 'text-gray-400 dark:text-gray-600' : 'text-gray-600 dark:text-gray-400 hover:bg-gray-200 dark:hover:bg-gray-700'}`}
-                    aria-label="Previous stage"
-                  >
+                  <button onClick={navigateToPreviousStage} disabled={currentStageIndex === 0}
+                    className={`p-1 rounded-md ${currentStageIndex === 0 ? 'text-gray-400 dark:text-gray-600' : 'text-gray-600 dark:text-gray-400 hover:bg-gray-200 dark:hover:bg-gray-700'}`}>
                     <FaChevronLeft size={12} />
                   </button>
-
-                  <div className="text-xs text-gray-600 dark:text-gray-400">
-                    {currentStageIndex + 1} / {researchStages.length}
-                  </div>
-
-                  <button
-                    onClick={() => navigateToNextStage()}
-                    disabled={currentStageIndex === researchStages.length - 1}
-                    className={`p-1 rounded-md ${currentStageIndex === researchStages.length - 1 ? 'text-gray-400 dark:text-gray-600' : 'text-gray-600 dark:text-gray-400 hover:bg-gray-200 dark:hover:bg-gray-700'}`}
-                    aria-label="Next stage"
-                  >
+                  <div className="text-xs text-gray-600 dark:text-gray-400">{currentStageIndex + 1} / {researchStages.length}</div>
+                  <button onClick={navigateToNextStage} disabled={currentStageIndex === researchStages.length - 1}
+                    className={`p-1 rounded-md ${currentStageIndex === researchStages.length - 1 ? 'text-gray-400 dark:text-gray-600' : 'text-gray-600 dark:text-gray-400 hover:bg-gray-200 dark:hover:bg-gray-700'}`}>
                     <FaChevronRight size={12} />
                   </button>
-
                   <div className="text-xs text-gray-600 dark:text-gray-400 ml-2">
                     {researchStages[currentStageIndex]?.title || `Stage ${currentStageIndex + 1}`}
                   </div>
                 </div>
               )}
 
-            <div className="flex items-center space-x-2">
-              {/* Download button */}
-              <button
-                onClick={downloadresponse}
-                className="text-xs text-gray-500 dark:text-gray-400 hover:text-green-600 dark:hover:text-green-400 px-2 py-1 rounded-md hover:bg-gray-200 dark:hover:bg-gray-700 flex items-center gap-1"
-                title="Download response as markdown file"
-              >
-                <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
-                </svg>
-                Download
-              </button>
+              <div className="flex items-center space-x-2 ml-auto">
+                {/* Download button */}
+                <button onClick={downloadresponse}
+                  className="text-xs text-gray-500 dark:text-gray-400 hover:text-green-600 dark:hover:text-green-400 px-2 py-1 rounded-md hover:bg-gray-200 dark:hover:bg-gray-700 flex items-center gap-1"
+                  title="下载为 Markdown">
+                  <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                  </svg>
+                  Download
+                </button>
+                {/* Clear button */}
+                <button id="ask-clear-conversation" onClick={clearConversation}
+                  className="text-xs text-gray-500 dark:text-gray-400 hover:text-purple-600 dark:hover:text-purple-400 px-2 py-1 rounded-md hover:bg-gray-200 dark:hover:bg-gray-700">
+                  Clear conversation
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
 
-              {/* Clear button */}
+        {/* Codemap panel */}
+        {(codeMapLoading || codeMapContent) && (
+          <div className="mt-4">
+            {/* Panel header */}
+            <div className="flex items-center justify-between px-4 py-2 mb-2 bg-teal-50 dark:bg-teal-900/20 border border-teal-200 dark:border-teal-800 rounded-lg">
               <button
-                id="ask-clear-conversation"
-                onClick={clearConversation}
-                className="text-xs text-gray-500 dark:text-gray-400 hover:text-purple-600 dark:hover:text-purple-400 px-2 py-1 rounded-md hover:bg-gray-200 dark:hover:bg-gray-700"
+                onClick={() => setCodeMapExpanded(e => !e)}
+                className="flex items-center gap-2 text-teal-800 dark:text-teal-200 text-sm font-medium flex-1 text-left"
               >
-                Clear conversation
+                <svg className="w-4 h-4 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 20l-5.447-2.724A1 1 0 013 16.382V5.618a1 1 0 011.447-.894L9 7m0 13l6-3m-6 3V7m6 10l4.553 2.276A1 1 0 0021 18.382V7.618a1 1 0 00-.553-.894L15 4m0 13V4m0 0L9 7" />
+                </svg>
+                <span>代码调用链路</span>
+                {codeMapLoading && (
+                  <div className="w-3 h-3 rounded-full border-2 border-t-transparent border-teal-500 animate-spin ml-1" />
+                )}
+                <svg className={`w-4 h-4 transition-transform ml-1 ${codeMapExpanded ? 'rotate-180' : ''}`} fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+                </svg>
+              </button>
+              {/* Fullscreen button */}
+              <button
+                onClick={() => { setCodeMapExpanded(true); setCodeMapFullscreen(f => !f); }}
+                className="ml-2 p-1 text-teal-600 dark:text-teal-400 hover:text-teal-800 dark:hover:text-teal-200 transition-colors"
+                title="全屏查看"
+              >
+                <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3.75 3.75v4.5m0-4.5h4.5m-4.5 0L9 9M3.75 20.25v-4.5m0 4.5h4.5m-4.5 0L9 15M20.25 3.75h-4.5m4.5 0v4.5m0-4.5L15 9m5.25 11.25h-4.5m4.5 0v-4.5m0 4.5L15 15" />
+                </svg>
               </button>
             </div>
-              </div>
+
+            {/* Interactive codemap */}
+            {codeMapExpanded && !codeMapFullscreen && (
+              <CodeMapView
+                codemapRaw={codeMapContent}
+                isLoading={codeMapLoading}
+                repoUrl={getRepoUrl(repoInfo)}
+                repoType={repoInfo.type || 'github'}
+                repoToken={repoInfo.token ?? undefined}
+                branch={branch}
+                isFullscreen={false}
+                onToggleFullscreen={() => setCodeMapFullscreen(true)}
+              />
+            )}
           </div>
+        )}
+
+        {/* Fullscreen codemap overlay */}
+        {codeMapFullscreen && (
+          <CodeMapView
+            codemapRaw={codeMapContent}
+            isLoading={codeMapLoading}
+            repoUrl={getRepoUrl(repoInfo)}
+            repoType={repoInfo.type || 'github'}
+            repoToken={repoInfo.token ?? undefined}
+            branch={branch}
+            isFullscreen={true}
+            onToggleFullscreen={() => setCodeMapFullscreen(false)}
+          />
         )}
 
         {/* Loading indicator */}
@@ -811,93 +827,77 @@ const Ask: React.FC<AskProps> = ({
               </div>
               <span className="text-xs text-gray-500 dark:text-gray-400">
                 {deepResearch
-                  ? (researchIteration === 0
-                    ? "Planning research approach..."
-                    : `Research iteration ${researchIteration} in progress...`)
+                  ? (researchIteration === 0 ? "Planning research approach..." : `Research iteration ${researchIteration} in progress...`)
                   : "Thinking..."}
               </span>
             </div>
-            {deepResearch && (
-              <div className="mt-2 text-xs text-gray-500 dark:text-gray-400 pl-5">
-                <div className="flex flex-col space-y-1">
-                  {researchIteration === 0 && (
-                    <>
-                      <div className="flex items-center">
-                        <div className="w-2 h-2 bg-blue-500 rounded-full mr-2"></div>
-                        <span>Creating research plan...</span>
-                      </div>
-                      <div className="flex items-center">
-                        <div className="w-2 h-2 bg-green-500 rounded-full mr-2"></div>
-                        <span>Identifying key areas to investigate...</span>
-                      </div>
-                    </>
-                  )}
-                  {researchIteration === 1 && (
-                    <>
-                      <div className="flex items-center">
-                        <div className="w-2 h-2 bg-blue-500 rounded-full mr-2"></div>
-                        <span>Exploring first research area in depth...</span>
-                      </div>
-                      <div className="flex items-center">
-                        <div className="w-2 h-2 bg-green-500 rounded-full mr-2"></div>
-                        <span>Analyzing code patterns and structures...</span>
-                      </div>
-                    </>
-                  )}
-                  {researchIteration === 2 && (
-                    <>
-                      <div className="flex items-center">
-                        <div className="w-2 h-2 bg-amber-500 rounded-full mr-2"></div>
-                        <span>Investigating remaining questions...</span>
-                      </div>
-                      <div className="flex items-center">
-                        <div className="w-2 h-2 bg-purple-500 rounded-full mr-2"></div>
-                        <span>Connecting findings from previous iterations...</span>
-                      </div>
-                    </>
-                  )}
-                  {researchIteration === 3 && (
-                    <>
-                      <div className="flex items-center">
-                        <div className="w-2 h-2 bg-indigo-500 rounded-full mr-2"></div>
-                        <span>Exploring deeper connections...</span>
-                      </div>
-                      <div className="flex items-center">
-                        <div className="w-2 h-2 bg-blue-500 rounded-full mr-2"></div>
-                        <span>Analyzing complex patterns...</span>
-                      </div>
-                    </>
-                  )}
-                  {researchIteration === 4 && (
-                    <>
-                      <div className="flex items-center">
-                        <div className="w-2 h-2 bg-teal-500 rounded-full mr-2"></div>
-                        <span>Refining research conclusions...</span>
-                      </div>
-                      <div className="flex items-center">
-                        <div className="w-2 h-2 bg-cyan-500 rounded-full mr-2"></div>
-                        <span>Addressing remaining edge cases...</span>
-                      </div>
-                    </>
-                  )}
-                  {researchIteration >= 5 && (
-                    <>
-                      <div className="flex items-center">
-                        <div className="w-2 h-2 bg-purple-500 rounded-full mr-2"></div>
-                        <span>Finalizing comprehensive answer...</span>
-                      </div>
-                      <div className="flex items-center">
-                        <div className="w-2 h-2 bg-green-500 rounded-full mr-2"></div>
-                        <span>Synthesizing all research findings...</span>
-                      </div>
-                    </>
-                  )}
-                </div>
-              </div>
-            )}
           </div>
         )}
       </div>
+
+      {/* ── History Drawer ──────────────────────────────────────────────── */}
+      {historyOpen && (
+        <div className="fixed inset-0 z-50 flex">
+          {/* Backdrop */}
+          <div className="absolute inset-0 bg-black/40" onClick={() => setHistoryOpen(false)} />
+          {/* Panel */}
+          <div className="relative ml-auto w-80 max-w-full h-full bg-[var(--card-bg)] shadow-xl flex flex-col border-l border-[var(--border-color)]">
+            <div className="flex items-center justify-between px-4 py-3 border-b border-[var(--border-color)]">
+              <h2 className="text-sm font-semibold text-[var(--foreground)]">历史对话</h2>
+              <button onClick={() => setHistoryOpen(false)} className="text-[var(--muted)] hover:text-[var(--foreground)]">
+                <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                </svg>
+              </button>
+            </div>
+            <div className="flex-1 overflow-y-auto">
+              {savedHistory.length === 0 ? (
+                <div className="p-6 text-center text-sm text-[var(--muted)]">暂无历史记录</div>
+              ) : (
+                savedHistory.map(conv => (
+                  <div key={conv.id} className="group border-b border-[var(--border-color)] px-4 py-3 hover:bg-[var(--background)]/50 transition-colors">
+                    <div className="flex items-start justify-between gap-2">
+                      <button className="flex-1 text-left" onClick={() => restoreConversation(conv)}>
+                        <div className="text-xs font-medium text-[var(--foreground)] line-clamp-2 leading-relaxed">{conv.title}</div>
+                        <div className="text-[10px] text-[var(--muted)] mt-1">
+                          {new Date(conv.timestamp).toLocaleString('zh-CN', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}
+                          {' · '}
+                          <span className="opacity-70">{conv.repoUrl.split('/').slice(-2).join('/')}</span>
+                        </div>
+                      </button>
+                      <button
+                        onClick={() => {
+                          deleteFromHistory(conv.id);
+                          setSavedHistory(prev => prev.filter(c => c.id !== conv.id));
+                        }}
+                        className="opacity-0 group-hover:opacity-100 text-[var(--muted)] hover:text-red-500 transition-opacity p-0.5 mt-0.5 flex-shrink-0"
+                        title="删除"
+                      >
+                        <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                        </svg>
+                      </button>
+                    </div>
+                  </div>
+                ))
+              )}
+            </div>
+            {savedHistory.length > 0 && (
+              <div className="px-4 py-3 border-t border-[var(--border-color)]">
+                <button
+                  onClick={() => {
+                    localStorage.removeItem(HISTORY_KEY);
+                    setSavedHistory([]);
+                  }}
+                  className="text-xs text-red-500 hover:text-red-700 transition-colors"
+                >
+                  清空全部历史
+                </button>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
 
       {/* Model Selection Modal */}
       <ModelSelectionModal

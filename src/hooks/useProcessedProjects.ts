@@ -8,6 +8,7 @@ interface ProcessedProject {
   repo_type: string;
   submittedAt: number;
   language: string;
+  default_branch?: string;
 }
 
 export function useProcessedProjects() {

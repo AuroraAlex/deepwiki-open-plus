@@ -5,7 +5,7 @@ services:
       dockerfile: Dockerfile
     ports:
       - "${PORT:-8001}:${PORT:-8001}"  # API port
-      - "3000:3000"  # Next.js port
+      - "3001:3000"  # Next.js port
     env_file:
       - .env
     environment:
@@ -17,7 +17,9 @@ services:
     volumes:
       - ~/.adalflow:/root/.adalflow      # Persist repository and embedding data
       - ./api/logs:/app/api/logs          # Persist log files across container restarts
+      - ~/Workspace/Vecentek/deepwiki-open/:/app/data/repo  # Persist data directory for vector store and other files
     # Resource limits for docker-compose up (not Swarm mode)
+    restart: unless-stopped
     mem_limit: 6g
     mem_reservation: 2g
     # Health check configuration

@@ -106,7 +106,8 @@ const addTokensToRequestBody = (
   excludedDirs?: string,
   excludedFiles?: string,
   includedDirs?: string,
-  includedFiles?: string
+  includedFiles?: string,
+  branch?: string,
 ): void => {
   if (token !== '') {
     requestBody.token = token;
@@ -135,6 +136,10 @@ const addTokensToRequestBody = (
     requestBody.included_files = includedFiles;
   }
 
+  // Add branch if specified
+  if (branch) {
+    requestBody.branch = branch;
+  }
 };
 
 const createGithubHeaders = (githubToken: string): HeadersInit => {
@@ -192,6 +197,7 @@ export default function RepoWikiPage() {
   const isCustomModelParam = searchParams.get('is_custom_model') === 'true';
   const customModelParam = searchParams.get('custom_model') || '';
   const language = searchParams.get('language') || 'en';
+  const branchParam = searchParams.get('branch') || '';
   const repoHost = (() => {
     if (!repoUrl) return '';
     try {
@@ -359,8 +365,7 @@ export default function RepoWikiPage() {
         setAuthRequired(data.auth_required);
       } catch (err) {
         console.error("Failed to fetch auth status:", err);
-        // Assuming auth is required if fetch fails to avoid blocking UI for safety
-        setAuthRequired(true);
+        setAuthRequired(false);
       } finally {
         setIsAuthLoading(false);
       }
@@ -537,7 +542,7 @@ Remember:
         };
 
         // Add tokens if available
-        addTokensToRequestBody(requestBody, currentToken, effectiveRepoInfo.type, selectedProviderState, selectedModelState, isCustomSelectedModelState, customSelectedModelState, language, modelExcludedDirs, modelExcludedFiles, modelIncludedDirs, modelIncludedFiles);
+        addTokensToRequestBody(requestBody, currentToken, effectiveRepoInfo.type, selectedProviderState, selectedModelState, isCustomSelectedModelState, customSelectedModelState, language, modelExcludedDirs, modelExcludedFiles, modelIncludedDirs, modelIncludedFiles, branchParam || defaultBranch || undefined);
 
         // Use WebSocket for communication
         let content = '';
@@ -834,7 +839,7 @@ IMPORTANT:
       };
 
       // Add tokens if available
-      addTokensToRequestBody(requestBody, currentToken, effectiveRepoInfo.type, selectedProviderState, selectedModelState, isCustomSelectedModelState, customSelectedModelState, language, modelExcludedDirs, modelExcludedFiles, modelIncludedDirs, modelIncludedFiles);
+      addTokensToRequestBody(requestBody, currentToken, effectiveRepoInfo.type, selectedProviderState, selectedModelState, isCustomSelectedModelState, customSelectedModelState, language, modelExcludedDirs, modelExcludedFiles, modelIncludedDirs, modelIncludedFiles, branchParam || defaultBranch || undefined);
 
       // Use WebSocket for communication
       let responseText = '';
@@ -1400,83 +1405,106 @@ IMPORTANT:
         }
       }
       else if (effectiveRepoInfo.type === 'bitbucket') {
-        // Bitbucket API approach
-        const repoPath = extractUrlPath(effectiveRepoInfo.repoUrl ?? '') ?? `${owner}/${repo}`;
-        const encodedRepoPath = encodeURIComponent(repoPath);
+        const repoUrlStr = effectiveRepoInfo.repoUrl ?? '';
+        const parsedBbUrl = new URL(repoUrlStr.startsWith('http') ? repoUrlStr : `https://${repoUrlStr}`);
+        const bbHostname = parsedBbUrl.hostname;
+        const isCloud = bbHostname === 'bitbucket.org' || bbHostname === 'www.bitbucket.org';
 
-        // Try to get the file tree for common branch names
-        let filesData = null;
+        let filesData: { values: { type: string; path: string }[] } | null = null;
         let apiErrorDetails = '';
         let defaultBranchLocal = '';
         const headers = createBitbucketHeaders(currentToken);
 
-        // First get project info to determine default branch
-        const projectInfoUrl = `https://api.bitbucket.org/2.0/repositories/${encodedRepoPath}`;
-        try {
-          const response = await fetch(projectInfoUrl, { headers });
+        if (isCloud) {
+          // ── Bitbucket Cloud ──────────────────────────────────────────────
+          const repoPath = extractUrlPath(repoUrlStr) ?? `${owner}/${repo}`;
+          const encodedRepoPath = encodeURIComponent(repoPath);
 
-          const responseText = await response.text();
+          const projectInfoUrl = `https://api.bitbucket.org/2.0/repositories/${encodedRepoPath}`;
+          try {
+            const response = await fetch(projectInfoUrl, { headers });
+            const responseText = await response.text();
 
-          if (response.ok) {
-            const projectData = JSON.parse(responseText);
-            defaultBranchLocal = projectData.mainbranch.name;
-            // Store the default branch in state
-            setDefaultBranch(defaultBranchLocal);
+            if (response.ok) {
+              const projectData = JSON.parse(responseText);
+              defaultBranchLocal = projectData.mainbranch.name;
+              setDefaultBranch(defaultBranchLocal);
 
-            const apiUrl = `https://api.bitbucket.org/2.0/repositories/${encodedRepoPath}/src/${defaultBranchLocal}/?recursive=true&per_page=100`;
-            try {
-              const response = await fetch(apiUrl, {
-                headers
-              });
-
-              const structureResponseText = await response.text();
-
-              if (response.ok) {
-                filesData = JSON.parse(structureResponseText);
-              } else {
-                const errorData = structureResponseText;
-                apiErrorDetails = `Status: ${response.status}, Response: ${errorData}`;
+              const apiUrl = `https://api.bitbucket.org/2.0/repositories/${encodedRepoPath}/src/${defaultBranchLocal}/?recursive=true&per_page=100`;
+              try {
+                const srcResponse = await fetch(apiUrl, { headers });
+                const structureResponseText = await srcResponse.text();
+                if (srcResponse.ok) {
+                  filesData = JSON.parse(structureResponseText);
+                } else {
+                  apiErrorDetails = `Status: ${srcResponse.status}, Response: ${structureResponseText}`;
+                }
+              } catch (err) {
+                console.error(`Network error fetching Bitbucket Cloud branch ${defaultBranchLocal}:`, err);
               }
-            } catch (err) {
-              console.error(`Network error fetching Bitbucket branch ${defaultBranchLocal}:`, err);
+            } else {
+              apiErrorDetails = `Status: ${response.status}, Response: ${responseText}`;
             }
-          } else {
-            const errorData = responseText;
-            apiErrorDetails = `Status: ${response.status}, Response: ${errorData}`;
+          } catch (err) {
+            console.error("Network error fetching Bitbucket Cloud project info:", err);
           }
-        } catch (err) {
-          console.error("Network error fetching Bitbucket project info:", err);
-        }
 
-        if (!filesData || !Array.isArray(filesData.values) || filesData.values.length === 0) {
-          if (apiErrorDetails) {
-            throw new Error(`Could not fetch repository structure. Bitbucket API Error: ${apiErrorDetails}`);
-          } else {
+          if (!filesData || !Array.isArray(filesData.values) || filesData.values.length === 0) {
+            if (apiErrorDetails) {
+              throw new Error(`Could not fetch repository structure. Bitbucket API Error: ${apiErrorDetails}`);
+            } else {
+              throw new Error('Could not fetch repository structure. Repository might not exist, be empty or private.');
+            }
+          }
+
+          fileTreeData = filesData.values
+            .filter((item) => item.type === 'commit_file')
+            .map((item) => item.path)
+            .join('\n');
+
+          try {
+            const readmeResponse = await fetch(
+              `https://api.bitbucket.org/2.0/repositories/${encodedRepoPath}/src/${defaultBranchLocal}/README.md`,
+              { headers }
+            );
+            if (readmeResponse.ok) {
+              readmeContent = await readmeResponse.text();
+            } else {
+              console.warn(`Could not fetch Bitbucket Cloud README.md, status: ${readmeResponse.status}`);
+            }
+          } catch (err) {
+            console.warn('Could not fetch Bitbucket Cloud README.md, continuing with empty README', err);
+          }
+
+        } else {
+          // ── Bitbucket Server / Data Center (self-hosted) ─────────────────
+          // Route through the backend proxy to avoid browser CORS restrictions.
+          const proxyParams = new URLSearchParams({ repo_url: repoUrlStr });
+          if (currentToken) proxyParams.set('token', currentToken);
+          if (branchParam) proxyParams.set('branch', branchParam);
+          const proxyUrl = `/api/bitbucket-proxy?${proxyParams.toString()}`;
+          console.log('Bitbucket Server: using backend proxy', proxyUrl);
+
+          const proxyResp = await fetch(proxyUrl);
+          if (!proxyResp.ok) {
+            const errText = await proxyResp.text();
+            throw new Error(`Could not fetch repository structure. Bitbucket proxy error (${proxyResp.status}): ${errText}`);
+          }
+
+          const proxyData = await proxyResp.json();
+          defaultBranchLocal = proxyData.defaultBranch ?? 'main';
+          setDefaultBranch(defaultBranchLocal);
+
+          const rawFiles: string[] = proxyData.files ?? [];
+          if (rawFiles.length === 0) {
             throw new Error('Could not fetch repository structure. Repository might not exist, be empty or private.');
           }
-        }
 
-        // Convert files data to a string representation
-        fileTreeData = filesData.values
-          .filter((item: { type: string; path: string }) => item.type === 'commit_file')
-          .map((item: { type: string; path: string }) => item.path)
-          .join('\n');
-
-        // Try to fetch README.md content
-        try {
-          const headers = createBitbucketHeaders(currentToken);
-
-          const readmeResponse = await fetch(`https://api.bitbucket.org/2.0/repositories/${encodedRepoPath}/src/${defaultBranchLocal}/README.md`, {
-            headers
-          });
-
-          if (readmeResponse.ok) {
-            readmeContent = await readmeResponse.text();
-          } else {
-            console.warn(`Could not fetch Bitbucket README.md, status: ${readmeResponse.status}`);
-          }
-        } catch (err) {
-          console.warn('Could not fetch Bitbucket README.md, continuing with empty README', err);
+          filesData = {
+            values: rawFiles.map((p: string) => ({ type: 'commit_file', path: p }))
+          };
+          fileTreeData = rawFiles.join('\n');
+          readmeContent = proxyData.readme ?? '';
         }
       }
 
@@ -1715,6 +1743,11 @@ IMPORTANT:
                 setSelectedProviderState(cachedData.provider);
               }
 
+              // Restore default branch if available
+              if(cachedData.default_branch) {
+                setDefaultBranch(cachedData.default_branch);
+              }
+
               // Update repoInfo
               if(cachedData.repo) {
                 setEffectiveRepoInfo(cachedData.repo);
@@ -1905,7 +1938,8 @@ IMPORTANT:
               wiki_structure: structureToCache,
               generated_pages: generatedPages,
               provider: selectedProviderState,
-              model: selectedModelState
+              model: selectedModelState,
+              default_branch: defaultBranch
             };
             const response = await fetch(`/api/wiki_cache`, {
               method: 'POST',
@@ -1928,7 +1962,7 @@ IMPORTANT:
     };
 
     saveCache();
-  }, [isLoading, error, wikiStructure, generatedPages, effectiveRepoInfo.owner, effectiveRepoInfo.repo, effectiveRepoInfo.type, effectiveRepoInfo.repoUrl, repoUrl, language, isComprehensiveView]);
+  }, [isLoading, error, wikiStructure, generatedPages, effectiveRepoInfo.owner, effectiveRepoInfo.repo, effectiveRepoInfo.type, effectiveRepoInfo.repoUrl, repoUrl, language, isComprehensiveView, defaultBranch]);
 
   const handlePageSelect = (pageId: string) => {
     if (currentPageId != pageId) {
@@ -2238,6 +2272,7 @@ IMPORTANT:
               isCustomModel={isCustomSelectedModelState}
               customModel={customSelectedModelState}
               language={language}
+              branch={branchParam || defaultBranch || undefined}
               onRef={(ref) => (askComponentRef.current = ref)}
             />
           </div>

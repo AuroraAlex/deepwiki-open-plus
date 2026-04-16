@@ -391,12 +391,12 @@ class DashscopeClient(ModelClient):
     def call(self, api_kwargs: Dict = {}, model_type: ModelType = ModelType.UNDEFINED):
         """Call the Dashscope API."""
         if model_type == ModelType.LLM:
-            if not api_kwargs.get("stream", False):
-                # For non-streaming, enable_thinking must be false.
-                # Pass it via extra_body to avoid TypeError from openai client validation.
-                extra_body = api_kwargs.get("extra_body", {})
-                extra_body["enable_thinking"] = False
-                api_kwargs["extra_body"] = extra_body
+            # Always disable thinking mode.  parse_stream_response only reads
+            # delta.content; with thinking ON Qwen3 models put output in
+            # delta.reasoning_content leaving delta.content=None → empty response.
+            extra_body = api_kwargs.get("extra_body", {})
+            extra_body["enable_thinking"] = False
+            api_kwargs["extra_body"] = extra_body
 
             completion = self.sync_client.chat.completions.create(**api_kwargs)
             
@@ -503,11 +503,10 @@ class DashscopeClient(ModelClient):
             self.async_client = self.init_async_client()
 
         if model_type == ModelType.LLM:
-            if not api_kwargs.get("stream", False):
-                # For non-streaming, enable_thinking must be false.
-                extra_body = api_kwargs.get("extra_body", {})
-                extra_body["enable_thinking"] = False
-                api_kwargs["extra_body"] = extra_body
+            # Always disable thinking mode (see call() comment for rationale).
+            extra_body = api_kwargs.get("extra_body", {})
+            extra_body["enable_thinking"] = False
+            api_kwargs["extra_body"] = extra_body
 
             completion = await self.async_client.chat.completions.create(**api_kwargs)
 

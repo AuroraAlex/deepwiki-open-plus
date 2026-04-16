@@ -23,7 +23,8 @@ from api.prompts import (
     DEEP_RESEARCH_FIRST_ITERATION_PROMPT,
     DEEP_RESEARCH_FINAL_ITERATION_PROMPT,
     DEEP_RESEARCH_INTERMEDIATE_ITERATION_PROMPT,
-    SIMPLE_CHAT_SYSTEM_PROMPT
+    SIMPLE_CHAT_SYSTEM_PROMPT,
+    CODEMAP_SYSTEM_PROMPT,
 )
 
 # Configure logging
@@ -62,6 +63,7 @@ class ChatCompletionRequest(BaseModel):
     filePath: Optional[str] = Field(None, description="Optional path to a file in the repository to include in the prompt")
     token: Optional[str] = Field(None, description="Personal access token for private repositories")
     type: Optional[str] = Field("github", description="Type of repository (e.g., 'github', 'gitlab', 'bitbucket')")
+    branch: Optional[str] = Field(None, description="Branch to analyze (defaults to repository's default branch)")
 
     # model parameters
     provider: str = Field("google", description="Model provider (google, openai, openrouter, ollama, bedrock, azure, dashscope)")
@@ -111,7 +113,7 @@ async def chat_completions_stream(request: ChatCompletionRequest):
                 included_files = [unquote(file_pattern) for file_pattern in request.included_files.split('\n') if file_pattern.strip()]
                 logger.info(f"Using custom included files: {included_files}")
 
-            request_rag.prepare_retriever(request.repo_url, request.type, request.token, excluded_dirs, excluded_files, included_dirs, included_files)
+            request_rag.prepare_retriever(request.repo_url, request.type, request.token, excluded_dirs, excluded_files, included_dirs, included_files, branch=request.branch)
             logger.info(f"Retriever prepared for {request.repo_url}")
         except ValueError as e:
             if "No valid documents with embeddings found" in str(e):
@@ -744,6 +746,135 @@ async def chat_completions_stream(request: ChatCompletionRequest):
         error_msg = f"Error in streaming chat completion: {str(e_handler)}"
         logger.error(error_msg)
         raise HTTPException(status_code=500, detail=error_msg)
+
+@app.post("/codemap/stream")
+async def codemap_stream(request: ChatCompletionRequest):
+    """Generate a Mermaid call-chain diagram for the question using RAG context."""
+    try:
+        # Build RAG retriever
+        try:
+            request_rag = RAG(provider=request.provider, model=request.model)
+            request_rag.prepare_retriever(request.repo_url, request.type, request.token, branch=request.branch)
+        except Exception as e:
+            logger.error(f"Error preparing retriever for codemap: {str(e)}")
+            raise HTTPException(status_code=500, detail=f"Error preparing retriever: {str(e)}")
+
+        if not request.messages:
+            raise HTTPException(status_code=400, detail="No messages provided")
+
+        query = request.messages[-1].content
+
+        # Retrieve relevant code context
+        context_text = ""
+        try:
+            retrieved = request_rag(query, language=request.language)
+            if retrieved and retrieved[0].documents:
+                docs_by_file: dict = {}
+                for doc in retrieved[0].documents:
+                    fp = doc.meta_data.get("file_path", "unknown")
+                    docs_by_file.setdefault(fp, []).append(doc)
+                parts = []
+                for fp, docs in docs_by_file.items():
+                    parts.append(f"## File: {fp}\n\n" + "\n\n".join(d.text for d in docs))
+                context_text = "\n\n---\n\n".join(parts)
+        except Exception as e:
+            logger.warning(f"RAG retrieval failed for codemap: {e}")
+
+        repo_url = request.repo_url
+        repo_name = repo_url.split("/")[-1] if "/" in repo_url else repo_url
+        repo_type = request.type or "github"
+        language_code = request.language or configs["lang_config"]["default"]
+        language_name = configs["lang_config"]["supported_languages"].get(language_code, "English")
+
+        system_prompt_text = CODEMAP_SYSTEM_PROMPT.format(
+            repo_type=repo_type,
+            repo_url=repo_url,
+            repo_name=repo_name,
+            language_name=language_name,
+        )
+
+        prompt = f"{system_prompt_text}\n\n"
+        if context_text.strip():
+            prompt += f"<START_OF_CONTEXT>\n{context_text}\n<END_OF_CONTEXT>\n\n"
+        else:
+            prompt += "<note>No code context retrieved. Generate the best diagram possible from the question alone.</note>\n\n"
+        prompt += f"<query>\n{query}\n</query>\n\nAssistant: "
+
+        model_config = get_model_config(request.provider, request.model)["model_kwargs"]
+
+        async def codemap_response_stream():
+            try:
+                if request.provider == "ollama":
+                    m = OllamaClient()
+                    kwargs = m.convert_inputs_to_api_kwargs(
+                        input=prompt,
+                        model_kwargs={"model": model_config["model"], "stream": True,
+                                      "options": {"temperature": model_config.get("temperature", 0.3),
+                                                  "top_p": model_config.get("top_p", 0.9),
+                                                  "num_ctx": model_config.get("num_ctx", 4096)}},
+                        model_type=ModelType.LLM,
+                    )
+                    resp = await m.acall(api_kwargs=kwargs, model_type=ModelType.LLM)
+                    async for chunk in resp:
+                        text = getattr(chunk, "response", None) or getattr(chunk, "text", None) or str(chunk)
+                        if text and not text.startswith("model="):
+                            yield text
+                elif request.provider in ("openai", "openrouter", "azure"):
+                    client_map = {"openai": OpenAIClient, "openrouter": OpenRouterClient, "azure": AzureAIClient}
+                    m = client_map[request.provider]()
+                    kw = {"model": request.model, "stream": True,
+                          "temperature": model_config.get("temperature", 0.3)}
+                    if "top_p" in model_config:
+                        kw["top_p"] = model_config["top_p"]
+                    kwargs = m.convert_inputs_to_api_kwargs(input=prompt, model_kwargs=kw, model_type=ModelType.LLM)
+                    resp = await m.acall(api_kwargs=kwargs, model_type=ModelType.LLM)
+                    async for chunk in resp:
+                        choices = getattr(chunk, "choices", [])
+                        if choices:
+                            delta = getattr(choices[0], "delta", None)
+                            if delta:
+                                text = getattr(delta, "content", None)
+                                if text:
+                                    yield text
+                elif request.provider == "bedrock":
+                    m = BedrockClient()
+                    kw = {"model": request.model, "temperature": model_config.get("temperature", 0.3),
+                          "top_p": model_config.get("top_p", 0.9)}
+                    kwargs = m.convert_inputs_to_api_kwargs(input=prompt, model_kwargs=kw, model_type=ModelType.LLM)
+                    resp = await m.acall(api_kwargs=kwargs, model_type=ModelType.LLM)
+                    yield str(resp) if isinstance(resp, str) else str(resp)
+                elif request.provider == "dashscope":
+                    m = DashscopeClient()
+                    kw = {"model": request.model, "stream": True,
+                          "temperature": model_config.get("temperature", 0.3),
+                          "top_p": model_config.get("top_p", 0.9)}
+                    kwargs = m.convert_inputs_to_api_kwargs(input=prompt, model_kwargs=kw, model_type=ModelType.LLM)
+                    resp = await m.acall(api_kwargs=kwargs, model_type=ModelType.LLM)
+                    async for text in resp:
+                        if text:
+                            yield text
+                else:
+                    # Google (default)
+                    m = genai.GenerativeModel(
+                        model_name=model_config["model"],
+                        generation_config={"temperature": model_config.get("temperature", 0.3),
+                                           "top_p": model_config.get("top_p", 0.9),
+                                           "top_k": model_config.get("top_k", 40)},
+                    )
+                    for chunk in m.generate_content(prompt, stream=True):
+                        if hasattr(chunk, "text"):
+                            yield chunk.text
+            except Exception as e:
+                logger.error(f"Error in codemap stream: {e}")
+                yield f"\nError generating codemap: {str(e)}"
+
+        return StreamingResponse(codemap_response_stream(), media_type="text/event-stream")
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Codemap error: {str(e)}")
+
 
 @app.get("/")
 async def root():

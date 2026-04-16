@@ -56,6 +56,7 @@ class ProcessedProjectEntry(BaseModel):
     repo_type: str # Renamed from type to repo_type for clarity with existing models
     submittedAt: int # Timestamp
     language: str # Extracted from filename
+    default_branch: Optional[str] = None
 
 class RepoInfo(BaseModel):
     owner: str
@@ -97,6 +98,7 @@ class WikiCacheData(BaseModel):
     repo: Optional[RepoInfo] = None
     provider: Optional[str] = None
     model: Optional[str] = None
+    default_branch: Optional[str] = None
 
 class WikiCacheRequest(BaseModel):
     """
@@ -108,6 +110,7 @@ class WikiCacheRequest(BaseModel):
     generated_pages: Dict[str, WikiPage]
     provider: str
     model: str
+    default_branch: Optional[str] = None
 
 class WikiExportRequest(BaseModel):
     """
@@ -391,11 +394,181 @@ def generate_json_export(repo_url: str, pages: List[WikiPage]) -> str:
     return json.dumps(export_data, indent=2)
 
 # Import the simplified chat implementation
-from api.simple_chat import chat_completions_stream
+from api.simple_chat import chat_completions_stream, codemap_stream
 from api.websocket_wiki import handle_websocket_chat
 
 # Add the chat_completions_stream endpoint to the main app
 app.add_api_route("/chat/completions/stream", chat_completions_stream, methods=["POST"])
+
+# Add the codemap endpoint
+app.add_api_route("/codemap/stream", codemap_stream, methods=["POST"])
+
+# File content endpoint
+from api.data_pipeline import get_file_content as _get_file_content
+
+@app.get("/file/content")
+async def get_file_content_api(
+    repo_url: str = Query(...),
+    file_path: str = Query(...),
+    type: str = Query("github"),
+    token: Optional[str] = Query(None),
+    branch: Optional[str] = Query(None),
+):
+    """Fetch raw content of a file from a repository (GitHub/GitLab/Bitbucket/local)."""
+    import os as _os
+
+    # Strip any leading slashes or /app/ prefixes that LLMs sometimes hallucinate
+    clean_path = file_path.lstrip("/")
+    if clean_path.startswith("app/"):
+        clean_path = clean_path[4:]
+
+    try:
+        if type == "local":
+            # For local repos repo_url is the filesystem path to the repo root
+            full = _os.path.realpath(_os.path.join(repo_url, clean_path))
+            root = _os.path.realpath(repo_url)
+            if not full.startswith(root):
+                raise HTTPException(status_code=403, detail="Path traversal denied")
+            if not _os.path.isfile(full):
+                raise HTTPException(status_code=404, detail=f"File not found: {clean_path}")
+            with open(full, "r", encoding="utf-8", errors="replace") as fh:
+                content = fh.read()
+        else:
+            content = _get_file_content(repo_url, clean_path, type, token, branch)
+        return {"content": content, "filePath": clean_path}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# Bitbucket Server proxy endpoint (avoids browser CORS restrictions)
+@app.get("/bitbucket/repo-structure")
+def bitbucket_repo_structure(
+    repo_url: str = Query(..., description="Full Bitbucket Server repository URL"),
+    token: Optional[str] = Query(None, description="Personal Access Token"),
+    branch: Optional[str] = Query(None, description="Branch name (defaults to repo default branch)"),
+):
+    """
+    Server-side proxy for Bitbucket Server REST API.
+    Fetches file tree and README for a self-hosted Bitbucket repository,
+    bypassing browser CORS restrictions.
+    """
+    import requests as _requests
+    from urllib.parse import urlparse
+
+    logger.info(f"Bitbucket proxy: fetching repo structure for {repo_url}")
+
+    try:
+        parsed = urlparse(repo_url)
+        base_url = f"{parsed.scheme}://{parsed.netloc}"
+        path_parts = [p for p in parsed.path.split('/') if p]
+
+        # Determine project key and repo slug from URL path
+        project_key: Optional[str] = None
+        repo_slug: Optional[str] = None
+
+        if 'repos' in path_parts:
+            repos_idx = path_parts.index('repos')
+            repo_slug = path_parts[repos_idx + 1].replace('.git', '') if repos_idx + 1 < len(path_parts) else None
+            project_key = path_parts[repos_idx - 1] if repos_idx > 0 else None
+        elif 'scm' in path_parts:
+            scm_idx = path_parts.index('scm')
+            project_key = path_parts[scm_idx + 1] if scm_idx + 1 < len(path_parts) else None
+            repo_slug = path_parts[scm_idx + 2].replace('.git', '') if scm_idx + 2 < len(path_parts) else None
+        elif len(path_parts) >= 2:
+            project_key = path_parts[-2]
+            repo_slug = path_parts[-1].replace('.git', '')
+
+        if not project_key or not repo_slug:
+            raise HTTPException(status_code=400, detail=f"Could not parse project key and repo slug from URL: {repo_url}")
+
+        logger.info(f"Bitbucket proxy: project={project_key}, repo={repo_slug}, base={base_url}")
+
+        headers = {}
+        if token:
+            headers['Authorization'] = f'Bearer {token}'
+
+        session = _requests.Session()
+        session.verify = False  # allow self-signed certs on private Bitbucket instances
+        session.headers.update(headers)
+
+        # 1. Resolve branch (use caller-supplied branch or auto-detect default)
+        if branch:
+            default_branch = branch
+            logger.info(f"Bitbucket proxy: using specified branch={default_branch}")
+        else:
+            default_branch = 'main'
+            branch_url = f"{base_url}/rest/api/1.0/projects/{project_key}/repos/{repo_slug}/branches/default"
+            logger.info(f"Bitbucket proxy: fetching default branch from {branch_url}")
+            try:
+                branch_resp = session.get(branch_url, timeout=30)
+                logger.info(f"Bitbucket proxy: branch response status={branch_resp.status_code}")
+                if branch_resp.status_code == 200:
+                    branch_data = branch_resp.json()
+                    default_branch = branch_data.get('displayId', 'main')
+                    logger.info(f"Bitbucket proxy: default branch={default_branch}")
+                else:
+                    logger.warning(f"Bitbucket proxy: branch fetch failed ({branch_resp.status_code}): {branch_resp.text[:200]}")
+            except Exception as e:
+                logger.warning(f"Bitbucket proxy: error fetching branch: {e}")
+
+        # 2. Get file list (with pagination)
+        all_files: list = []
+        next_start: Optional[int] = 0
+        page_num = 0
+        while next_start is not None:
+            files_url = (
+                f"{base_url}/rest/api/1.0/projects/{project_key}/repos/{repo_slug}"
+                f"/files?at={default_branch}&limit=1000&start={next_start}"
+            )
+            logger.info(f"Bitbucket proxy: fetching files page {page_num} from {files_url}")
+            try:
+                files_resp = session.get(files_url, timeout=30)
+                logger.info(f"Bitbucket proxy: files response status={files_resp.status_code}")
+                if files_resp.status_code == 200:
+                    files_data = files_resp.json()
+                    all_files.extend(files_data.get('values', []))
+                    next_start = None if files_data.get('isLastPage', True) else files_data.get('nextPageStart')
+                    page_num += 1
+                else:
+                    logger.error(f"Bitbucket proxy: files fetch failed ({files_resp.status_code}): {files_resp.text[:500]}")
+                    raise HTTPException(
+                        status_code=files_resp.status_code,
+                        detail=f"Bitbucket Server API error: {files_resp.status_code} {files_resp.text[:200]}"
+                    )
+            except HTTPException:
+                raise
+            except Exception as e:
+                logger.error(f"Bitbucket proxy: error fetching files: {e}")
+                raise HTTPException(status_code=502, detail=f"Error contacting Bitbucket Server: {e}")
+
+        logger.info(f"Bitbucket proxy: fetched {len(all_files)} files")
+
+        # 3. Try to fetch README
+        readme_content = ''
+        readme_url = f"{base_url}/rest/api/1.0/projects/{project_key}/repos/{repo_slug}/raw/README.md?at={default_branch}"
+        try:
+            readme_resp = session.get(readme_url, timeout=15)
+            if readme_resp.status_code == 200:
+                readme_content = readme_resp.text
+                logger.info("Bitbucket proxy: fetched README.md successfully")
+            else:
+                logger.info(f"Bitbucket proxy: README.md not found ({readme_resp.status_code})")
+        except Exception as e:
+            logger.warning(f"Bitbucket proxy: error fetching README: {e}")
+
+        return {
+            "defaultBranch": default_branch,
+            "files": all_files,
+            "readme": readme_content,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Bitbucket proxy: unexpected error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 # Add the WebSocket endpoint
 app.add_websocket_route("/ws/chat", handle_websocket_chat)
@@ -433,7 +606,8 @@ async def save_wiki_cache(data: WikiCacheRequest) -> bool:
             generated_pages=data.generated_pages,
             repo=data.repo,
             provider=data.provider,
-            model=data.model
+            model=data.model,
+            default_branch=data.default_branch
         )
         # Log size of data to be cached for debugging (avoid logging full content if large)
         try:
@@ -607,6 +781,15 @@ async def get_processed_projects():
                         language = parts[-1] # language is the last part
                         repo = "_".join(parts[2:-1]) # repo can contain underscores
 
+                        # Read default_branch from cache file
+                        default_branch = None
+                        try:
+                            with open(file_path, 'r', encoding='utf-8') as f:
+                                cache_data = json.load(f)
+                                default_branch = cache_data.get('default_branch')
+                        except Exception:
+                            pass
+
                         project_entries.append(
                             ProcessedProjectEntry(
                                 id=filename,
@@ -615,7 +798,8 @@ async def get_processed_projects():
                                 name=f"{owner}/{repo}",
                                 repo_type=repo_type,
                                 submittedAt=int(stats.st_mtime * 1000), # Convert to milliseconds
-                                language=language
+                                language=language,
+                                default_branch=default_branch
                             )
                         )
                     else:

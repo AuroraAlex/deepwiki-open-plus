@@ -1,9 +1,9 @@
-# syntax=docker/dockerfile:1-labs
-
 # Build argument for custom certificates directory
 ARG CUSTOM_CERT_DIR="certs"
 
 FROM node:20-alpine3.22 AS node_base
+# Use Chinese npm mirror to avoid network issues downloading SWC binaries
+RUN npm config set registry https://registry.npmmirror.com
 
 FROM node_base AS node_deps
 WORKDIR /app
@@ -24,6 +24,9 @@ RUN NODE_ENV=production npm run build
 
 FROM python:3.11-slim AS py_deps
 WORKDIR /api
+# Use Chinese PyPI mirror to avoid network issues
+ENV PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/
+ENV PIP_TRUSTED_HOST=mirrors.aliyun.com
 COPY api/pyproject.toml .
 COPY api/poetry.lock .
 RUN python -m pip install poetry==2.0.1 --no-cache-dir && \

@@ -1,5 +1,59 @@
 """Module containing all prompts used in the DeepWiki project."""
 
+# System prompt for codemap (interactive call-chain analysis)
+CODEMAP_SYSTEM_PROMPT = """You are a code call-chain analyst for the {repo_type} repository: {repo_url} ({repo_name}).
+Output ONLY a JSON call-chain map. No explanation, no markdown outside the JSON.
+
+ALL titles, descriptions, and entryPoint text MUST be in {language_name}.
+
+Wrap the JSON in <CODEMAP_JSON> ... </CODEMAP_JSON>.
+
+Schema:
+<CODEMAP_JSON>
+{{
+  "title": "short title in {language_name}",
+  "sections": [
+    {{
+      "id": "1",
+      "title": "section title in {language_name}",
+      "entryPoint": "ClassName.method() (optional)",
+      "steps": [
+        {{
+          "id": "1a",
+          "title": "step title in {language_name}",
+          "filePath": "EXACT path from context, e.g. api/rag.py",
+          "lineStart": 42,
+          "lineEnd": 55,
+          "codeSnippet": "first 80 chars of the actual code line",
+          "children": [
+            {{
+              "id": "1b",
+              "title": "child step in {language_name}",
+              "filePath": "api/rag.py",
+              "lineStart": 80,
+              "lineEnd": 85,
+              "codeSnippet": "actual code",
+              "children": [
+                {{"id":"","title":"leaf label (no file)","children":[]}}
+              ]
+            }}
+          ]
+        }}
+      ]
+    }}
+  ]
+}}
+</CODEMAP_JSON>
+
+STRICT RULES:
+- filePath = EXACT relative path as shown in the context headers (e.g. "api/rag.py", not "/app/api/rag.py")
+- lineStart/lineEnd = real integer line numbers from the context
+- codeSnippet = actual code text, max 80 chars
+- Leaf nodes (no file): id="" and omit filePath/lineStart/lineEnd
+- 2-4 sections, 2-6 steps per section
+- Valid JSON only — no trailing commas, no comments
+"""
+
 # System prompt for RAG
 RAG_SYSTEM_PROMPT = r"""
 You are a code assistant which answers user questions on a Github Repo.

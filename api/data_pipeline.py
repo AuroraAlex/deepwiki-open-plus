@@ -1,5 +1,6 @@
 import adalflow as adal
 from adalflow.core.types import Document, List
+from typing import Optional
 from adalflow.components.data_process import TextSplitter, ToEmbeddings
 import os
 import subprocess
@@ -69,7 +70,16 @@ def count_tokens(text: str, embedder_type: str = None, is_ollama_embedder: bool 
         # Rough approximation: 4 characters per token
         return len(text) // 4
 
-def download_repo(repo_url: str, local_path: str, repo_type: str = None, access_token: str = None) -> str:
+def _repo_has_content(path: str) -> bool:
+    """Check if a repo directory has actual content files (not just .git and dotfiles)."""
+    if not os.path.exists(path):
+        return False
+    entries = os.listdir(path)
+    # A repo with only dotfiles (e.g. .git, .gitignore) is considered empty/broken
+    non_dot_entries = [e for e in entries if not e.startswith('.')]
+    return len(non_dot_entries) > 0
+
+def download_repo(repo_url: str, local_path: str, repo_type: Optional[str] = None, access_token: Optional[str] = None, branch: Optional[str] = None) -> str:
     """
     Downloads a Git repository (GitHub, GitLab, or Bitbucket) to a specified local path.
 
@@ -78,6 +88,7 @@ def download_repo(repo_url: str, local_path: str, repo_type: str = None, access_
         repo_url (str): The URL of the Git repository to clone.
         local_path (str): The local directory where the repository will be cloned.
         access_token (str, optional): Access token for private repositories.
+        branch (str, optional): Branch to clone. Defaults to the repository's default branch.
 
     Returns:
         str: The output message from the `git` command.
@@ -92,46 +103,88 @@ def download_repo(repo_url: str, local_path: str, repo_type: str = None, access_
             stderr=subprocess.PIPE,
         )
 
-        # Check if repository already exists
-        if os.path.exists(local_path) and os.listdir(local_path):
-            # Directory exists and is not empty
+        # Check if repository already exists with actual content
+        if os.path.exists(local_path) and _repo_has_content(local_path):
             logger.warning(f"Repository already exists at {local_path}. Using existing repository.")
             return f"Using existing repository at {local_path}"
+        elif os.path.exists(local_path) and os.listdir(local_path):
+            # Directory exists but only has dotfiles (.git, .gitignore) – broken/empty clone
+            logger.warning(f"Repository at {local_path} has no content files (only dotfiles). Removing and re-cloning.")
+            import shutil
+            shutil.rmtree(local_path)
 
         # Ensure the local path exists
         os.makedirs(local_path, exist_ok=True)
 
-        # Prepare the clone URL with access token if provided
+        # Prepare the clone URL and git arguments
         clone_url = repo_url
+        extra_git_args: list = []  # additional -c flags prepended before "clone"
+
         if access_token:
             parsed = urlparse(repo_url)
-            # URL-encode the token to handle special characters
             encoded_token = quote(access_token, safe='')
-            # Determine the repository type and format the URL accordingly
+
             if repo_type == "github":
                 # Format: https://{token}@{domain}/owner/repo.git
-                # Works for both github.com and enterprise GitHub domains
                 clone_url = urlunparse((parsed.scheme, f"{encoded_token}@{parsed.netloc}", parsed.path, '', '', ''))
+                logger.info("Using access token for GitHub authentication")
+
             elif repo_type == "gitlab":
                 # Format: https://oauth2:{token}@gitlab.com/owner/repo.git
                 clone_url = urlunparse((parsed.scheme, f"oauth2:{encoded_token}@{parsed.netloc}", parsed.path, '', '', ''))
-            elif repo_type == "bitbucket":
-                # Format: https://x-token-auth:{token}@bitbucket.org/owner/repo.git
-                clone_url = urlunparse((parsed.scheme, f"x-token-auth:{encoded_token}@{parsed.netloc}", parsed.path, '', '', ''))
+                logger.info("Using access token for GitLab authentication")
 
-            logger.info("Using access token for authentication")
+            elif repo_type == "bitbucket":
+                # Bitbucket Server PAT: use http.extraHeader so Bearer auth works regardless
+                # of server version (x-token-auth in the URL only works on newer versions).
+                # Convert browse URL (/projects/PROJ/repos/REPO) → SCM clone URL if needed.
+                parsed_path = parsed.path
+                path_parts = [p for p in parsed_path.split('/') if p]
+                if 'projects' in path_parts and 'repos' in path_parts:
+                    repos_idx = path_parts.index('repos')
+                    project_key = path_parts[repos_idx - 1] if repos_idx > 0 else ''
+                    repo_slug = path_parts[repos_idx + 1] if repos_idx + 1 < len(path_parts) else ''
+                    if project_key and repo_slug:
+                        parsed_path = f"/scm/{project_key}/{repo_slug}.git"
+                        logger.info(f"Converted Bitbucket Server browse URL to SCM clone path: {parsed_path}")
+                clone_url = urlunparse((parsed.scheme, parsed.netloc, parsed_path, '', '', ''))
+                # Pass PAT as Bearer token via HTTP header (works for all Bitbucket Server versions)
+                extra_git_args = ["-c", f"http.extraHeader=Authorization: Bearer {access_token}"]
+                logger.info("Using Bearer token (http.extraHeader) for Bitbucket authentication")
+
+        # For Bitbucket Server browse URLs without a token, also convert to SCM clone URL
+        elif repo_type == "bitbucket" and not access_token:
+            parsed = urlparse(repo_url)
+            path_parts = [p for p in parsed.path.split('/') if p]
+            if 'projects' in path_parts and 'repos' in path_parts:
+                repos_idx = path_parts.index('repos')
+                project_key = path_parts[repos_idx - 1] if repos_idx > 0 else ''
+                repo_slug = path_parts[repos_idx + 1] if repos_idx + 1 < len(path_parts) else ''
+                if project_key and repo_slug:
+                    clone_path = f"/scm/{project_key}/{repo_slug}.git"
+                    clone_url = urlunparse((parsed.scheme, parsed.netloc, clone_path, '', '', ''))
+                    logger.info(f"Converted Bitbucket Server browse URL to SCM clone path: {clone_path}")
 
         # Clone the repository
-        logger.info(f"Cloning repository from {repo_url} to {local_path}")
-        # We use repo_url in the log to avoid exposing the token in logs
+        branch_desc = f" (branch: {branch})" if branch else " (default branch)"
+        logger.info(f"Cloning repository from {repo_url} to {local_path}{branch_desc}")
+        # Build the command: git [-c key=value ...] clone --depth=1 --single-branch [--branch <branch>] <url> <path>
+        branch_args = ["--branch", branch] if branch else []
+        git_cmd = ["git"] + extra_git_args + ["clone", "--depth=1", "--single-branch"] + branch_args + [clone_url, local_path]
         result = subprocess.run(
-            ["git", "clone", "--depth=1", "--single-branch", clone_url, local_path],
+            git_cmd,
             check=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
 
         logger.info("Repository cloned successfully")
+        # Log a quick summary of what was cloned
+        try:
+            top = os.listdir(local_path)
+            logger.info(f"Cloned repo top-level ({len(top)} entries): {sorted(top)[:20]}")
+        except Exception:
+            pass
         return result.stdout.decode("utf-8")
 
     except subprocess.CalledProcessError as e:
@@ -180,7 +233,8 @@ def read_all_documents(path: str, embedder_type: str = None, is_ollama_embedder:
     documents = []
     # File extensions to look for, prioritizing code files
     code_extensions = [".py", ".js", ".ts", ".java", ".cpp", ".c", ".h", ".hpp", ".go", ".rs",
-                       ".jsx", ".tsx", ".html", ".css", ".php", ".swift", ".cs"]
+                       ".jsx", ".tsx", ".vue", ".html", ".css", ".scss", ".less",
+                       ".php", ".swift", ".cs", ".rb", ".kt", ".scala", ".dart"]
     doc_extensions = [".md", ".txt", ".rst", ".json", ".yaml", ".yml"]
 
     # Determine filtering mode: inclusion or exclusion
@@ -231,6 +285,13 @@ def read_all_documents(path: str, embedder_type: str = None, is_ollama_embedder:
         logger.info(f"Excluded files: {excluded_files}")
 
     logger.info(f"Reading documents from {path}")
+
+    # Log what actually exists in the repo root for diagnostics
+    try:
+        top_entries = os.listdir(path)
+        logger.info(f"Repo root contents ({len(top_entries)} entries): {sorted(top_entries)[:30]}")
+    except Exception as _e:
+        logger.warning(f"Could not list repo root: {_e}")
 
     def should_process_file(file_path: str, use_inclusion: bool, included_dirs: List[str], included_files: List[str],
                            excluded_dirs: List[str], excluded_files: List[str]) -> bool:
@@ -304,9 +365,11 @@ def read_all_documents(path: str, embedder_type: str = None, is_ollama_embedder:
     # Process code files first
     for ext in code_extensions:
         files = glob.glob(f"{path}/**/*{ext}", recursive=True)
+        kept, skipped_excl, skipped_err = 0, 0, 0
         for file_path in files:
             # Check if file should be processed based on inclusion/exclusion rules
             if not should_process_file(file_path, use_inclusion_mode, included_dirs, included_files, excluded_dirs, excluded_files):
+                skipped_excl += 1
                 continue
 
             try:
@@ -325,6 +388,7 @@ def read_all_documents(path: str, embedder_type: str = None, is_ollama_embedder:
                     token_count = count_tokens(content, embedder_type)
                     if token_count > MAX_EMBEDDING_TOKENS * 10:
                         logger.warning(f"Skipping large file {relative_path}: Token count ({token_count}) exceeds limit")
+                        skipped_err += 1
                         continue
 
                     doc = Document(
@@ -339,8 +403,13 @@ def read_all_documents(path: str, embedder_type: str = None, is_ollama_embedder:
                         },
                     )
                     documents.append(doc)
+                    kept += 1
             except Exception as e:
                 logger.error(f"Error reading {file_path}: {e}")
+                skipped_err += 1
+
+        if files:
+            logger.info(f"  {ext}: found={len(files)}, kept={kept}, skipped_by_filter={skipped_excl}, skipped_by_error={skipped_err}")
 
     # Then process documentation files
     for ext in doc_extensions:
@@ -449,7 +518,7 @@ def transform_documents_and_save_to_db(
     db.save_state(filepath=db_path)
     return db
 
-def get_github_file_content(repo_url: str, file_path: str, access_token: str = None) -> str:
+def get_github_file_content(repo_url: str, file_path: str, access_token: str = None, branch: str = None) -> str:
     """
     Retrieves the content of a file from a GitHub repository using the GitHub API.
     Supports both public GitHub (github.com) and GitHub Enterprise (custom domains).
@@ -491,6 +560,8 @@ def get_github_file_content(repo_url: str, file_path: str, access_token: str = N
         # Use GitHub API to get file content
         # The API endpoint for getting file content is: /repos/{owner}/{repo}/contents/{path}
         api_url = f"{api_base}/repos/{owner}/{repo}/contents/{file_path}"
+        if branch:
+            api_url += f"?ref={branch}"
 
         # Fetch file content from GitHub API
         headers = {}
@@ -526,7 +597,7 @@ def get_github_file_content(repo_url: str, file_path: str, access_token: str = N
     except Exception as e:
         raise ValueError(f"Failed to get file content: {str(e)}")
 
-def get_gitlab_file_content(repo_url: str, file_path: str, access_token: str = None) -> str:
+def get_gitlab_file_content(repo_url: str, file_path: str, access_token: str = None, branch: str = None) -> str:
     """
     Retrieves the content of a file from a GitLab repository (cloud or self-hosted).
 
@@ -562,24 +633,28 @@ def get_gitlab_file_content(repo_url: str, file_path: str, access_token: str = N
         encoded_file_path = quote(file_path, safe='')
 
         # Try to get the default branch from the project info
-        default_branch = None
-        try:
-            project_info_url = f"{gitlab_domain}/api/v4/projects/{encoded_project_path}"
-            project_headers = {}
-            if access_token:
-                project_headers["PRIVATE-TOKEN"] = access_token
-            
-            project_response = requests.get(project_info_url, headers=project_headers)
-            if project_response.status_code == 200:
-                project_data = project_response.json()
-                default_branch = project_data.get('default_branch', 'main')
-                logger.info(f"Found default branch: {default_branch}")
-            else:
-                logger.warning(f"Could not fetch project info, using 'main' as default branch")
+        if branch:
+            default_branch = branch
+            logger.info(f"Using specified branch: {default_branch}")
+        else:
+            default_branch = None
+            try:
+                project_info_url = f"{gitlab_domain}/api/v4/projects/{encoded_project_path}"
+                project_headers = {}
+                if access_token:
+                    project_headers["PRIVATE-TOKEN"] = access_token
+                
+                project_response = requests.get(project_info_url, headers=project_headers)
+                if project_response.status_code == 200:
+                    project_data = project_response.json()
+                    default_branch = project_data.get('default_branch', 'main')
+                    logger.info(f"Found default branch: {default_branch}")
+                else:
+                    logger.warning(f"Could not fetch project info, using 'main' as default branch")
+                    default_branch = 'main'
+            except Exception as e:
+                logger.warning(f"Error fetching project info: {e}, using 'main' as default branch")
                 default_branch = 'main'
-        except Exception as e:
-            logger.warning(f"Error fetching project info: {e}, using 'main' as default branch")
-            default_branch = 'main'
 
         api_url = f"{gitlab_domain}/api/v4/projects/{encoded_project_path}/repository/files/{encoded_file_path}/raw?ref={default_branch}"
         # Fetch file content from GitLab API
@@ -608,63 +683,134 @@ def get_gitlab_file_content(repo_url: str, file_path: str, access_token: str = N
     except Exception as e:
         raise ValueError(f"Failed to get file content: {str(e)}")
 
-def get_bitbucket_file_content(repo_url: str, file_path: str, access_token: str = None) -> str:
+def get_bitbucket_file_content(repo_url: str, file_path: str, access_token: str = None, branch: str = None) -> str:
     """
-    Retrieves the content of a file from a Bitbucket repository using the Bitbucket API.
+    Retrieves the content of a file from a Bitbucket repository.
+
+    Supports both Bitbucket Cloud (bitbucket.org) and Bitbucket Server / Data Center
+    (self-hosted instances). PAT (Personal Access Token) authentication is supported
+    for both variants.
 
     Args:
-        repo_url (str): The URL of the Bitbucket repository (e.g., "https://bitbucket.org/username/repo")
+        repo_url (str): The URL of the Bitbucket repository.
+                        Cloud:  "https://bitbucket.org/username/repo"
+                        Server: "https://bitbucket.example.com/projects/PROJ/repos/myrepo"
+                                or the SCM clone URL  "https://bitbucket.example.com/scm/PROJ/myrepo"
         file_path (str): The path to the file within the repository (e.g., "src/main.py")
-        access_token (str, optional): Bitbucket personal access token for private repositories
+        access_token (str, optional): PAT for private repositories
 
     Returns:
         str: The content of the file as a string
     """
     try:
-        # Extract owner and repo name from Bitbucket URL
-        if not (repo_url.startswith("https://bitbucket.org/") or repo_url.startswith("http://bitbucket.org/")):
-            raise ValueError("Not a valid Bitbucket repository URL")
+        parsed = urlparse(repo_url.rstrip('/'))
+        hostname = parsed.hostname or ''
+        path_parts = [p for p in parsed.path.split('/') if p]
 
-        parts = repo_url.rstrip('/').split('/')
-        if len(parts) < 5:
-            raise ValueError("Invalid Bitbucket URL format")
+        is_cloud = hostname in ('bitbucket.org', 'www.bitbucket.org')
 
-        owner = parts[-2]
-        repo = parts[-1].replace(".git", "")
+        if is_cloud:
+            # ── Bitbucket Cloud ──────────────────────────────────────────────────
+            if len(path_parts) < 2:
+                raise ValueError("Invalid Bitbucket Cloud URL format")
 
-        # Try to get the default branch from the repository info
-        default_branch = None
-        try:
-            repo_info_url = f"https://api.bitbucket.org/2.0/repositories/{owner}/{repo}"
-            repo_headers = {}
-            if access_token:
-                repo_headers["Authorization"] = f"Bearer {access_token}"
-            
-            repo_response = requests.get(repo_info_url, headers=repo_headers)
-            if repo_response.status_code == 200:
-                repo_data = repo_response.json()
-                default_branch = repo_data.get('mainbranch', {}).get('name', 'main')
-                logger.info(f"Found default branch: {default_branch}")
+            owner = path_parts[-2]
+            repo = path_parts[-1].replace(".git", "")
+
+            # Resolve default branch via Cloud REST API
+            if branch:
+                default_branch = branch
+                logger.info(f"Using specified branch: {default_branch}")
             else:
-                logger.warning(f"Could not fetch repository info, using 'main' as default branch")
                 default_branch = 'main'
-        except Exception as e:
-            logger.warning(f"Error fetching repository info: {e}, using 'main' as default branch")
-            default_branch = 'main'
+                try:
+                    repo_info_url = f"https://api.bitbucket.org/2.0/repositories/{owner}/{repo}"
+                    repo_headers = {"Authorization": f"Bearer {access_token}"} if access_token else {}
+                    repo_response = requests.get(repo_info_url, headers=repo_headers, timeout=10)
+                    if repo_response.status_code == 200:
+                        default_branch = repo_response.json().get('mainbranch', {}).get('name', 'main')
+                        logger.info(f"Found default branch: {default_branch}")
+                    else:
+                        logger.warning("Could not fetch Bitbucket Cloud repo info, using 'main'")
+                except Exception as e:
+                    logger.warning(f"Error fetching Bitbucket Cloud repo info: {e}, using 'main'")
 
-        # Use Bitbucket API to get file content
-        # The API endpoint for getting file content is: /2.0/repositories/{owner}/{repo}/src/{branch}/{path}
-        api_url = f"https://api.bitbucket.org/2.0/repositories/{owner}/{repo}/src/{default_branch}/{file_path}"
+            api_url = (
+                f"https://api.bitbucket.org/2.0/repositories/{owner}/{repo}"
+                f"/src/{default_branch}/{file_path}"
+            )
+            headers = {"Authorization": f"Bearer {access_token}"} if access_token else {}
 
-        # Fetch file content from Bitbucket API
-        headers = {}
-        if access_token:
-            headers["Authorization"] = f"Bearer {access_token}"
+        else:
+            # ── Bitbucket Server / Data Center (self-hosted) ─────────────────────
+            base_url = f"{parsed.scheme}://{parsed.netloc}"
+
+            # Parse project key and repo slug from the URL.
+            # Supported formats:
+            #   Browse URL : /projects/{projectKey}/repos/{repoSlug}[/browse]
+            #   Clone URL  : /scm/{projectKey}/{repoSlug}[.git]
+            project_key = None
+            repo_slug = None
+
+            if 'repos' in path_parts:
+                repos_idx = path_parts.index('repos')
+                if repos_idx + 1 < len(path_parts):
+                    repo_slug = path_parts[repos_idx + 1].replace('.git', '')
+                    project_key = path_parts[repos_idx - 1] if repos_idx > 0 else None
+            elif 'scm' in path_parts:
+                scm_idx = path_parts.index('scm')
+                if scm_idx + 2 < len(path_parts):
+                    project_key = path_parts[scm_idx + 1]
+                    repo_slug = path_parts[scm_idx + 2].replace('.git', '')
+
+            if not project_key or not repo_slug:
+                # Generic fallback: treat last two path segments as project/repo
+                if len(path_parts) >= 2:
+                    project_key = path_parts[-2]
+                    repo_slug = path_parts[-1].replace('.git', '')
+                else:
+                    raise ValueError(
+                        "Could not parse project key and repo slug from Bitbucket Server URL. "
+                        "Expected format: /projects/{PROJECT}/repos/{REPO} or /scm/{PROJECT}/{REPO}"
+                    )
+
+            # Resolve default branch via Bitbucket Server REST API 1.0
+            if branch:
+                default_branch = branch
+                logger.info(f"Using specified branch: {default_branch}")
+            else:
+                default_branch = 'main'
+                try:
+                    branch_api_url = (
+                        f"{base_url}/rest/api/1.0/projects/{project_key}"
+                        f"/repos/{repo_slug}/branches/default"
+                    )
+                    info_headers = {"Authorization": f"Bearer {access_token}"} if access_token else {}
+                    branch_response = requests.get(branch_api_url, headers=info_headers, timeout=10)
+                    if branch_response.status_code == 200:
+                        default_branch = branch_response.json().get('displayId', 'main')
+                        logger.info(f"Found default branch: {default_branch}")
+                    else:
+                        logger.warning(
+                            f"Could not fetch default branch from Bitbucket Server "
+                            f"(HTTP {branch_response.status_code}), using 'main'"
+                        )
+                except Exception as e:
+                    logger.warning(f"Error fetching Bitbucket Server branch info: {e}, using 'main'")
+
+            # Raw file content endpoint for Bitbucket Server REST API 1.0
+            api_url = (
+                f"{base_url}/rest/api/1.0/projects/{project_key}"
+                f"/repos/{repo_slug}/raw/{file_path}?at={default_branch}"
+            )
+            headers = {"Authorization": f"Bearer {access_token}"} if access_token else {}
+
+        # ── Fetch file content ───────────────────────────────────────────────────
         logger.info(f"Fetching file content from Bitbucket API: {api_url}")
         try:
-            response = requests.get(api_url, headers=headers)
+            response = requests.get(api_url, headers=headers, timeout=30)
             if response.status_code == 200:
-                content = response.text
+                return response.text
             elif response.status_code == 404:
                 raise ValueError("File not found on Bitbucket. Please check the file path and repository.")
             elif response.status_code == 401:
@@ -675,8 +821,7 @@ def get_bitbucket_file_content(repo_url: str, file_path: str, access_token: str 
                 raise ValueError("Internal server error on Bitbucket. Please try again later.")
             else:
                 response.raise_for_status()
-                content = response.text
-            return content
+                return response.text
         except RequestException as e:
             raise ValueError(f"Error fetching file content: {e}")
 
@@ -684,7 +829,7 @@ def get_bitbucket_file_content(repo_url: str, file_path: str, access_token: str 
         raise ValueError(f"Failed to get file content: {str(e)}")
 
 
-def get_file_content(repo_url: str, file_path: str, repo_type: str = None, access_token: str = None) -> str:
+def get_file_content(repo_url: str, file_path: str, repo_type: str = None, access_token: str = None, branch: str = None) -> str:
     """
     Retrieves the content of a file from a Git repository (GitHub or GitLab).
 
@@ -701,11 +846,11 @@ def get_file_content(repo_url: str, file_path: str, repo_type: str = None, acces
         ValueError: If the file cannot be fetched or if the URL is not valid
     """
     if repo_type == "github":
-        return get_github_file_content(repo_url, file_path, access_token)
+        return get_github_file_content(repo_url, file_path, access_token, branch)
     elif repo_type == "gitlab":
-        return get_gitlab_file_content(repo_url, file_path, access_token)
+        return get_gitlab_file_content(repo_url, file_path, access_token, branch)
     elif repo_type == "bitbucket":
-        return get_bitbucket_file_content(repo_url, file_path, access_token)
+        return get_bitbucket_file_content(repo_url, file_path, access_token, branch)
     else:
         raise ValueError("Unsupported repository type. Only GitHub, GitLab, and Bitbucket are supported.")
 
@@ -719,10 +864,11 @@ class DatabaseManager:
         self.repo_url_or_path = None
         self.repo_paths = None
 
-    def prepare_database(self, repo_url_or_path: str, repo_type: str = None, access_token: str = None,
+    def prepare_database(self, repo_url_or_path: str, repo_type: Optional[str] = None, access_token: Optional[str] = None,
                          embedder_type: str = None, is_ollama_embedder: bool = None,
                          excluded_dirs: List[str] = None, excluded_files: List[str] = None,
-                         included_dirs: List[str] = None, included_files: List[str] = None) -> List[Document]:
+                         included_dirs: List[str] = None, included_files: List[str] = None,
+                         branch: Optional[str] = None) -> List[Document]:
         """
         Create a new database from the repository.
 
@@ -747,7 +893,7 @@ class DatabaseManager:
             embedder_type = 'ollama' if is_ollama_embedder else None
         
         self.reset_database()
-        self._create_repo(repo_url_or_path, repo_type, access_token)
+        self._create_repo(repo_url_or_path, repo_type, access_token, branch)
         return self.prepare_db_index(embedder_type=embedder_type, excluded_dirs=excluded_dirs, excluded_files=excluded_files,
                                    included_dirs=included_dirs, included_files=included_files)
 
@@ -759,22 +905,55 @@ class DatabaseManager:
         self.repo_url_or_path = None
         self.repo_paths = None
 
-    def _extract_repo_name_from_url(self, repo_url_or_path: str, repo_type: str) -> str:
-        # Extract owner and repo name to create unique identifier
+    def _extract_repo_name_from_url(self, repo_url_or_path: str, repo_type: Optional[str], branch: Optional[str] = None) -> str:
+        # Extract owner/project and repo name to create a unique local identifier.
         url_parts = repo_url_or_path.rstrip('/').split('/')
 
-        if repo_type in ["github", "gitlab", "bitbucket"] and len(url_parts) >= 5:
+        if repo_type == "bitbucket":
+            # Bitbucket Cloud  : https://bitbucket.org/{owner}/{repo}
+            # Bitbucket Server : https://{host}/projects/{PROJECT}/repos/{repo}
+            #                    https://{host}/scm/{PROJECT}/{repo}[.git]
+            parsed = urlparse(repo_url_or_path.rstrip('/'))
+            path_parts = [p for p in parsed.path.split('/') if p]
+            is_cloud = (parsed.hostname or '') in ('bitbucket.org', 'www.bitbucket.org')
+
+            if is_cloud and len(path_parts) >= 2:
+                owner = path_parts[-2]
+                repo = path_parts[-1].replace('.git', '')
+                repo_name = f"{owner}_{repo}"
+            elif 'repos' in path_parts:
+                # Server browse URL: /projects/{PROJECT}/repos/{repo}
+                repos_idx = path_parts.index('repos')
+                project = path_parts[repos_idx - 1] if repos_idx > 0 else 'unknown'
+                repo = path_parts[repos_idx + 1].replace('.git', '') if repos_idx + 1 < len(path_parts) else 'unknown'
+                repo_name = f"{project}_{repo}"
+            elif 'scm' in path_parts:
+                # Server clone URL: /scm/{PROJECT}/{repo}[.git]
+                scm_idx = path_parts.index('scm')
+                project = path_parts[scm_idx + 1] if scm_idx + 1 < len(path_parts) else 'unknown'
+                repo = path_parts[scm_idx + 2].replace('.git', '') if scm_idx + 2 < len(path_parts) else 'unknown'
+                repo_name = f"{project}_{repo}"
+            elif len(path_parts) >= 2:
+                owner = path_parts[-2]
+                repo = path_parts[-1].replace('.git', '')
+                repo_name = f"{owner}_{repo}"
+            else:
+                repo_name = url_parts[-1].replace('.git', '')
+        elif repo_type in ["github", "gitlab"] and len(url_parts) >= 5:
             # GitHub URL format: https://github.com/owner/repo
             # GitLab URL format: https://gitlab.com/owner/repo or https://gitlab.com/group/subgroup/repo
-            # Bitbucket URL format: https://bitbucket.org/owner/repo
             owner = url_parts[-2]
             repo = url_parts[-1].replace(".git", "")
             repo_name = f"{owner}_{repo}"
         else:
             repo_name = url_parts[-1].replace(".git", "")
+        # Append branch suffix so different branches get separate cache dirs
+        if branch:
+            safe_branch = branch.replace('/', '_').replace('\\', '_')
+            repo_name = f"{repo_name}__{safe_branch}"
         return repo_name
 
-    def _create_repo(self, repo_url_or_path: str, repo_type: str = None, access_token: str = None) -> None:
+    def _create_repo(self, repo_url_or_path: str, repo_type: Optional[str] = None, access_token: Optional[str] = None, branch: Optional[str] = None) -> None:
         """
         Download and prepare all paths.
         Paths:
@@ -788,6 +967,17 @@ class DatabaseManager:
         """
         logger.info(f"Preparing repo storage for {repo_url_or_path}...")
 
+        # Use a stable cache key suffix when no branch is specified.
+        # We use "__default" so that all callers that omit the branch
+        # will hit the same cache entry.  The actual git clone will
+        # fetch the remote's default branch (whatever that is).
+        if not branch:
+            branch = None  # keep None for git clone (auto-detect)
+            cache_branch = "default"
+            logger.info("No branch specified, will clone remote default branch (cache key suffix: 'default')")
+        else:
+            cache_branch = branch
+
         try:
             # Strip whitespace to handle URLs with leading/trailing spaces
             repo_url_or_path = repo_url_or_path.strip()
@@ -797,16 +987,20 @@ class DatabaseManager:
             os.makedirs(root_path, exist_ok=True)
             # url
             if repo_url_or_path.startswith("https://") or repo_url_or_path.startswith("http://"):
-                # Extract the repository name from the URL
-                repo_name = self._extract_repo_name_from_url(repo_url_or_path, repo_type)
+                # Extract the repository name from the URL (branch included for unique cache key)
+                repo_name = self._extract_repo_name_from_url(repo_url_or_path, repo_type, cache_branch)
                 logger.info(f"Extracted repo name: {repo_name}")
 
                 save_repo_dir = os.path.join(root_path, "repos", repo_name)
 
-                # Check if the repository directory already exists and is not empty
-                if not (os.path.exists(save_repo_dir) and os.listdir(save_repo_dir)):
-                    # Only download if the repository doesn't exist or is empty
-                    download_repo(repo_url_or_path, save_repo_dir, repo_type, access_token)
+                # Check if the repository directory already exists with actual content
+                if not (os.path.exists(save_repo_dir) and _repo_has_content(save_repo_dir)):
+                    # Remove broken/empty clone if it exists (e.g. only .git dir)
+                    if os.path.exists(save_repo_dir) and os.listdir(save_repo_dir):
+                        logger.warning(f"Repository at {save_repo_dir} has no content files. Removing stale clone.")
+                        import shutil
+                        shutil.rmtree(save_repo_dir)
+                    download_repo(repo_url_or_path, save_repo_dir, repo_type, access_token, branch)
                 else:
                     logger.info(f"Repository already exists at {save_repo_dir}. Using existing repository.")
             else:  # local path

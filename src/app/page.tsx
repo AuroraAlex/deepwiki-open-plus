@@ -98,6 +98,7 @@ export default function Home() {
           setExcludedFiles(config.excludedFiles || '');
           setIncludedDirs(config.includedDirs || '');
           setIncludedFiles(config.includedFiles || '');
+          setBranch(config.branch || '');
         }
       }
     } catch (error) {
@@ -135,6 +136,7 @@ export default function Home() {
   const [includedDirs, setIncludedDirs] = useState('');
   const [includedFiles, setIncludedFiles] = useState('');
   const [selectedPlatform, setSelectedPlatform] = useState<'github' | 'gitlab' | 'bitbucket'>('github');
+  const [branch, setBranch] = useState('');
   const [accessToken, setAccessToken] = useState('');
   const [error, setError] = useState<string | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
@@ -163,8 +165,7 @@ export default function Home() {
         setAuthRequired(data.auth_required);
       } catch (err) {
         console.error("Failed to fetch auth status:", err);
-        // Assuming auth is required if fetch fails to avoid blocking UI for safety
-        setAuthRequired(true);
+        setAuthRequired(false);
       } finally {
         setIsAuthLoading(false);
       }
@@ -261,6 +262,16 @@ export default function Home() {
 
     // If valid, open the configuration modal
     setError(null);
+
+    // Auto-detect platform from parsed URL type and update selectedPlatform
+    if (parsedRepo.type === 'bitbucket') {
+      setSelectedPlatform('bitbucket');
+    } else if (parsedRepo.type === 'gitlab') {
+      setSelectedPlatform('gitlab');
+    } else if (parsedRepo.type === 'github') {
+      setSelectedPlatform('github');
+    }
+
     setIsConfigModalOpen(true);
   };
 
@@ -318,6 +329,7 @@ export default function Home() {
           isCustomModel,
           customModel,
           selectedPlatform,
+          branch,
           excludedDirs,
           excludedFiles,
           includedDirs,
@@ -349,7 +361,9 @@ export default function Home() {
       params.append('token', accessToken);
     }
     // Always include the type parameter
-    params.append('type', (type == 'local' ? type : selectedPlatform) || 'github');
+    // Use detected type for known platforms; fall back to selectedPlatform for 'web' / unknown
+    const effectiveType = type === 'local' ? type : (type && type !== 'web' ? type : selectedPlatform);
+    params.append('type', effectiveType || 'github');
     // Add local path if it exists
     if (localPath) {
       params.append('local_path', encodeURIComponent(localPath));
@@ -374,6 +388,11 @@ export default function Home() {
     }
     if (includedFiles) {
       params.append('included_files', includedFiles);
+    }
+
+    // Add branch parameter if specified
+    if (branch.trim()) {
+      params.append('branch', branch.trim());
     }
 
     // Add language parameter
@@ -470,6 +489,8 @@ export default function Home() {
             setIncludedDirs={setIncludedDirs}
             includedFiles={includedFiles}
             setIncludedFiles={setIncludedFiles}
+            branch={branch}
+            setBranch={setBranch}
             onSubmit={handleGenerateWiki}
             isSubmitting={isSubmitting}
             authRequired={authRequired}

@@ -9,6 +9,7 @@ interface ApiProcessedProject {
   repo_type: string;
   submittedAt: number;
   language: string;
+  default_branch?: string;
 }
 // Payload for deleting a project cache
 interface DeleteProjectCachePayload {

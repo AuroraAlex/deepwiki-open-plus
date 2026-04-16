@@ -1,11 +1,18 @@
 {
   "embedder": {
     "client_class": "OpenAIClient",
-    "batch_size": 500,
+    "batch_size": 100,
     "model_kwargs": {
       "model": "text-embedding-3-small",
-      "dimensions": 256,
-      "encoding_format": "float"
+      "dimensions": 1536
+    }
+  },
+  "embedder_dashscope": {
+    "client_class": "DashscopeClient",
+    "batch_size": 10,
+    "model_kwargs": {
+      "model": "text-embedding-v4",
+      "dimensions": 1024
     }
   },
   "embedder_ollama": {

@@ -49,7 +49,7 @@ WIKI_AUTH_MODE = raw_auth_mode.lower() in ['true', '1', 't']
 WIKI_AUTH_CODE = os.environ.get('DEEPWIKI_AUTH_CODE', '')
 
 # Embedder settings
-EMBEDDER_TYPE = os.environ.get('DEEPWIKI_EMBEDDER_TYPE', 'openai').lower()
+EMBEDDER_TYPE = os.environ.get('DEEPWIKI_EMBEDDER_TYPE', 'dashscope').lower()
 
 # Get configuration directory from environment variable, or use default if not set
 CONFIG_DIR = os.environ.get('DEEPWIKI_CONFIG_DIR', None)
@@ -152,7 +152,7 @@ def load_embedder_config():
     embedder_config = load_json_config("embedder.json")
 
     # Process client classes
-    for key in ["embedder", "embedder_ollama", "embedder_google", "embedder_bedrock"]:
+    for key in ["embedder", "embedder_ollama", "embedder_google", "embedder_bedrock", "embedder_dashscope"]:
         if key in embedder_config and "client_class" in embedder_config[key]:
             class_name = embedder_config[key]["client_class"]
             if class_name in CLIENT_CLASSES:
@@ -174,6 +174,8 @@ def get_embedder_config():
         return configs.get("embedder_google", {})
     elif embedder_type == 'ollama' and 'embedder_ollama' in configs:
         return configs.get("embedder_ollama", {})
+    elif embedder_type == 'dashscope' and 'embedder_dashscope' in configs:
+        return configs.get("embedder_dashscope", {})
     else:
         return configs.get("embedder", {})
 
@@ -235,12 +237,30 @@ def is_bedrock_embedder():
     client_class = embedder_config.get("client_class", "")
     return client_class == "BedrockClient"
 
+def is_dashscope_embedder():
+    """
+    Check if the current embedder configuration uses DashscopeClient.
+
+    Returns:
+        bool: True if using DashscopeClient, False otherwise
+    """
+    embedder_config = get_embedder_config()
+    if not embedder_config:
+        return False
+
+    model_client = embedder_config.get("model_client")
+    if model_client:
+        return model_client.__name__ == "DashscopeClient"
+
+    client_class = embedder_config.get("client_class", "")
+    return client_class == "DashscopeClient"
+
 def get_embedder_type():
     """
     Get the current embedder type based on configuration.
-    
+
     Returns:
-        str: 'bedrock', 'ollama', 'google', or 'openai' (default)
+        str: 'bedrock', 'ollama', 'google', 'dashscope', or 'openai' (default)
     """
     if is_bedrock_embedder():
         return 'bedrock'
@@ -248,6 +268,8 @@ def get_embedder_type():
         return 'ollama'
     elif is_google_embedder():
         return 'google'
+    elif EMBEDDER_TYPE == 'dashscope':
+        return 'dashscope'
     else:
         return 'openai'
 
@@ -341,7 +363,7 @@ if generator_config:
 
 # Update embedder configuration
 if embedder_config:
-    for key in ["embedder", "embedder_ollama", "embedder_google", "embedder_bedrock", "retriever", "text_splitter"]:
+    for key in ["embedder", "embedder_ollama", "embedder_google", "embedder_bedrock", "embedder_dashscope", "retriever", "text_splitter"]:
         if key in embedder_config:
             configs[key] = embedder_config[key]
 

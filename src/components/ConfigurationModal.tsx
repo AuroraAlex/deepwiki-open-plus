@@ -35,6 +35,10 @@ interface ConfigurationModalProps {
   selectedPlatform: 'github' | 'gitlab' | 'bitbucket';
   setSelectedPlatform: (value: 'github' | 'gitlab' | 'bitbucket') => void;
 
+  // Branch selection
+  branch: string;
+  setBranch: (value: string) => void;
+
   // Access token
   accessToken: string;
   setAccessToken: (value: string) => void;
@@ -79,6 +83,8 @@ export default function ConfigurationModal({
   setCustomModel,
   selectedPlatform,
   setSelectedPlatform,
+  branch,
+  setBranch,
   accessToken,
   setAccessToken,
   excludedDirs,
@@ -228,6 +234,21 @@ export default function ConfigurationModal({
                 setIncludedDirs={setIncludedDirs}
                 includedFiles={includedFiles}
                 setIncludedFiles={setIncludedFiles}
+              />
+            </div>
+
+            {/* Branch selection */}
+            <div className="mb-4">
+              <label htmlFor="branch-input" className="block text-xs font-medium text-[var(--foreground)] mb-1">
+                {t.form?.branch || 'Branch'} <span className="text-[var(--muted)] font-normal">({t.form?.branchOptional || 'optional, defaults to repository default branch'})</span>
+              </label>
+              <input
+                id="branch-input"
+                type="text"
+                value={branch}
+                onChange={(e) => setBranch(e.target.value)}
+                placeholder={t.form?.branchPlaceholder || 'e.g. main, develop, feature/my-branch'}
+                className="input-japanese block w-full px-3 py-2 rounded-md bg-transparent text-[var(--foreground)] focus:outline-none focus:border-[var(--accent-primary)] text-sm border border-[var(--border-color)]"
               />
             </div>
 

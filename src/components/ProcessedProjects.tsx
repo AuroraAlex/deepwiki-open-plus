@@ -13,6 +13,7 @@ interface ProcessedProject {
   repo_type: string;
   submittedAt: number;
   language: string;
+  default_branch?: string;
 }
 
 interface ProcessedProjectsProps {
@@ -205,7 +206,7 @@ export default function ProcessedProjects({
                   <FaTimes className="h-4 w-4" />
                 </button>
                 <Link
-                  href={`/${project.owner}/${project.repo}?type=${project.repo_type}&language=${project.language}`}
+                  href={`/${project.owner}/${project.repo}?type=${project.repo_type}&language=${project.language}${project.default_branch ? `&branch=${project.default_branch}` : ''}`}
                   className="block"
                 >
                   <h3 className="text-lg font-semibold text-[var(--link-color)] hover:underline mb-2 line-clamp-2">
@@ -218,6 +219,11 @@ export default function ProcessedProjects({
                     <span className="px-2 py-1 text-xs bg-[var(--background)] text-[var(--muted)] rounded-full border border-[var(--border-color)]">
                       {project.language}
                     </span>
+                    {project.default_branch && (
+                      <span className="px-2 py-1 text-xs bg-green-500/10 text-green-600 dark:text-green-400 rounded-full border border-green-500/20">
+                        {project.default_branch}
+                      </span>
+                    )}
                   </div>
                   <p className="text-xs text-[var(--muted)]">
                     {t('processedOn')} {new Date(project.submittedAt).toLocaleDateString()}
@@ -235,12 +241,12 @@ export default function ProcessedProjects({
                   <FaTimes className="h-4 w-4" />
                 </button>
                 <Link
-                  href={`/${project.owner}/${project.repo}?type=${project.repo_type}&language=${project.language}`}
+                  href={`/${project.owner}/${project.repo}?type=${project.repo_type}&language=${project.language}${project.default_branch ? `&branch=${project.default_branch}` : ''}`}
                   className="flex items-center justify-between"
                 >
                   <div className="flex-1 min-w-0">
                     <h3 className="text-base font-medium text-[var(--link-color)] hover:underline truncate">
-                      {project.name}
+                      {project.name}{project.default_branch ? ` (${project.default_branch})` : ''}
                     </h3>
                     <p className="text-xs text-[var(--muted)] mt-1">
                       {t('processedOn')} {new Date(project.submittedAt).toLocaleDateString()} • {project.repo_type} • {project.language}
